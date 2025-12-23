@@ -557,8 +557,8 @@ For enterprise integrations requiring CA-backed certificates, the `spiffe` featu
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    Threshold CA Architecture                         │
 │                                                                      │
-│  1. DKG (one-time setup):                                           │
-│     - N signers run 3-round protocol via GossipSub                  │
+│  1. DKG (one-time setup, external):                                 │
+│     - N signers run 3-round protocol                                │
 │     - Each signer gets KeyPackage (private share)                   │
 │     - All get combined CA public key                                │
 │                                                                      │
@@ -574,37 +574,7 @@ For enterprise integrations requiring CA-backed certificates, the `spiffe` featu
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Running DKG (Key Generation Ceremony)
-
-```rust
-use korium::{ThresholdCaConfig, DkgCoordinator, SignerState};
-
-// Configure 5 signers, require 3 to sign (Byzantine fault tolerant)
-let config = ThresholdCaConfig::new(5, 3, "make.run")?;
-
-// Each signer creates a coordinator with all signer identities
-let coordinator = DkgCoordinator::new(config, all_signer_identities, my_identity)?;
-
-// Round 1: Generate and broadcast commitment
-let (round1_secret, round1_msg) = coordinator.round1()?;
-broadcast(round1_msg);  // Send via GossipSub
-
-// Round 2: Process received commitments, generate shares
-let (round2_secret, round2_msgs) = coordinator.round2(round1_secret, &received_round1)?;
-for msg in round2_msgs {
-    send_to_recipient(msg);  // Per-recipient packages
-}
-
-// Round 3: Finalize - produces SignerState with key share
-let signer_state: SignerState = coordinator.round3(
-    &round2_secret,
-    &all_round1_msgs,
-    &my_round2_msgs,
-)?;
-
-// Persist signer_state (contains private key share - encrypt at rest!)
-let serialized = signer_state.serialize()?;
-```
+> **Note:** DKG (Distributed Key Generation) is performed externally using the Korium CLI or custom tooling. The internal DKG protocol types are not part of the public API—nodes receive pre-generated `SignerState` from the ceremony.
 
 ### Node Integration
 
@@ -680,8 +650,6 @@ let cert_der = node.request_ca_certificate_from_mesh("example.org", Some("api-gw
 | `NodeBuilder::as_ca_signer()` | Configure node as CA signer |
 | `Node::request_ca_certificate_from_mesh()` | Request CA-signed certificate |
 
-> **Note:** DKG (Distributed Key Generation) is an internal implementation detail. Generate `SignerState` via external tooling or the Korium CLI.
-
 ### Security Properties
 
 | Property | Value |
@@ -750,9 +718,6 @@ cargo test --test node_public_api
 
 # Run relay tests
 cargo test --test relay_infrastructure
-
-# Run SPIFFE compatibility tests
-cargo test --features "spiffe" spiffe
 
 # Run Threshold CA tests
 cargo test --features "spiffe,test-pow" thresholdca

@@ -57,13 +57,16 @@ pub const MIN_SIGNERS: u16 = 3;
 pub const MAX_SIGNERS: u16 = 255;
 
 /// Timeout for each DKG round.
-pub const DKG_ROUND_TIMEOUT_SECS: u64 = 30;
+#[allow(dead_code)]
+pub(crate) const DKG_ROUND_TIMEOUT_SECS: u64 = 30;
 
 /// Timeout for collecting signature shares.
-pub const SIGNING_TIMEOUT_SECS: u64 = 10;
+#[allow(dead_code)]
+pub(crate) const SIGNING_TIMEOUT_SECS: u64 = 10;
 
 /// GossipSub topic for CSR broadcast.
-pub const TOPIC_CSR: &str = "csr";
+#[allow(dead_code)]
+pub(crate) const TOPIC_CSR: &str = "csr";
 
 /// RPC magic prefix for CA sign requests.
 /// Using 4 bytes to avoid collision with application payloads.
@@ -234,7 +237,7 @@ impl SignerRegistry {
 
         for (idx, identity) in identities.into_iter().enumerate() {
             let frost_id = (idx + 1) as u16; // FROST identifiers are 1-indexed
-            frost_to_identity.insert(frost_id, identity.clone());
+            frost_to_identity.insert(frost_id, identity);
             identity_to_frost.insert(identity, frost_id);
         }
 
@@ -278,7 +281,7 @@ impl SignerRegistry {
     pub fn rebuild_reverse_mapping(&mut self) {
         self.identity_to_frost.clear();
         for (&frost_id, identity) in &self.frost_to_identity {
-            self.identity_to_frost.insert(identity.clone(), frost_id);
+            self.identity_to_frost.insert(*identity, frost_id);
         }
     }
 }
@@ -288,8 +291,9 @@ impl SignerRegistry {
 // ============================================================================
 
 /// Message types for DKG protocol.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DkgMessage {
+pub(crate) enum DkgMessage {
     /// Round 1: Commitment broadcast (same to all participants).
     Round1 {
         /// Sender's Korium identity.
@@ -346,6 +350,7 @@ impl SigningRequest {
     }
 
     /// Set the SPIFFE workload path.
+    #[allow(dead_code)]
     #[must_use]
     pub fn with_workload_path(mut self, path: impl Into<String>) -> Self {
         self.workload_path = Some(path.into());
@@ -354,8 +359,9 @@ impl SigningRequest {
 }
 
 /// A partial signature share from a signer (legacy GossipSub format).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignatureShare {
+pub(crate) struct SignatureShare {
     /// Request ID this share is for.
     pub request_id: [u8; 32],
     /// Signer's Korium identity.
@@ -549,13 +555,15 @@ impl SignerState {
 ///
 /// This is used during the one-time setup phase to generate key shares
 /// without any single party seeing the complete private key.
-pub struct DkgCoordinator {
+#[allow(dead_code)]
+pub(crate) struct DkgCoordinator {
     config: ThresholdCaConfig,
     registry: SignerRegistry,
     my_identifier: Identifier,
     my_identity: Identity,
 }
 
+#[allow(dead_code)]
 impl DkgCoordinator {
     /// Create a new DKG coordinator.
     ///
@@ -595,13 +603,13 @@ impl DkgCoordinator {
     ///
     /// Returns the secret package (keep private) and the public package (broadcast to all).
     pub fn round1(&self) -> Result<(DkgRound1Secret, DkgMessage), ThresholdCaError> {
-        let mut rng = rand::rngs::OsRng;
+        let rng = rand::rngs::OsRng;
 
         let (secret_package, round1_package) = frost::keys::dkg::part1(
             self.my_identifier,
             self.config.max_signers,
             self.config.min_signers,
-            &mut rng,
+            rng,
         )
         .map_err(|e| ThresholdCaError::DkgFailed(e.to_string()))?;
 
@@ -610,7 +618,7 @@ impl DkgCoordinator {
             .map_err(|e| ThresholdCaError::Serialization(e.to_string()))?;
 
         let message = DkgMessage::Round1 {
-            sender: self.my_identity.clone(),
+            sender: self.my_identity,
             package: package_bytes,
         };
 
@@ -669,18 +677,17 @@ impl DkgCoordinator {
         // Create messages for each recipient
         let mut messages = Vec::new();
         for (recipient_id, package) in round2_packages {
-            let recipient = self
+            let recipient = *self
                 .registry
                 .get_identity(recipient_id)
-                .ok_or_else(|| ThresholdCaError::DkgFailed("unknown recipient".into()))?
-                .clone();
+                .ok_or_else(|| ThresholdCaError::DkgFailed("unknown recipient".into()))?;
 
             let package_bytes = package
                 .serialize()
                 .map_err(|e| ThresholdCaError::Serialization(e.to_string()))?;
 
             messages.push(DkgMessage::Round2 {
-                sender: self.my_identity.clone(),
+                sender: self.my_identity,
                 recipient,
                 package: package_bytes,
             });
@@ -772,10 +779,12 @@ impl DkgCoordinator {
 }
 
 /// Secret state from DKG Round 1 (must not be shared).
-pub struct DkgRound1Secret(frost::keys::dkg::round1::SecretPackage);
+#[allow(dead_code)]
+pub(crate) struct DkgRound1Secret(frost::keys::dkg::round1::SecretPackage);
 
 /// Secret state from DKG Round 2 (must not be shared).
-pub struct DkgRound2Secret(frost::keys::dkg::round2::SecretPackage);
+#[allow(dead_code)]
+pub(crate) struct DkgRound2Secret(frost::keys::dkg::round2::SecretPackage);
 
 // ============================================================================
 // Signing Operations
@@ -874,6 +883,7 @@ pub fn aggregate_signatures(
 }
 
 /// Verify a signature against the CA public key.
+#[allow(dead_code)]
 pub fn verify_ca_signature(
     pubkey_package: &frost::keys::PublicKeyPackage,
     message: &[u8],
@@ -945,6 +955,7 @@ impl CaPublicKey {
 // ============================================================================
 
 /// Result of CSR generation containing all data needed for threshold signing.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CertificateSigningRequest {
     /// DER-encoded TBSCertificate (the data to be signed).
@@ -1348,6 +1359,7 @@ pub fn assemble_certificate(tbs_der: &[u8], signature: &[u8]) -> Result<Vec<u8>,
 }
 
 /// Verify that a TBS certificate was signed by the threshold CA.
+#[allow(dead_code)]
 pub fn verify_tbs_signature(
     tbs: &[u8],
     signature: &[u8],

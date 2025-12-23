@@ -41,10 +41,9 @@ use anyhow::{Context, Result};
 use quinn::{Connection, Endpoint};
 use tracing::{debug, info, warn};
 
-#[cfg(not(feature = "spiffe"))]
 use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_config};
 #[cfg(feature = "spiffe")]
-use crate::crypto::{generate_ed25519_cert_with_spiffe, create_server_config, create_client_config, SpiffeConfig};
+use crate::crypto::{generate_ed25519_cert_with_spiffe, SpiffeConfig};
 use crate::dht::{DhtNode, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
 use crate::identity::{Contact, Keypair};
 use crate::messages::{Message, RelayResponse};
@@ -178,8 +177,14 @@ impl Node {
         let identity = keypair.identity();
         
         // Generate certificates with optional SPIFFE SAN
-        let (server_certs, server_key) = generate_ed25519_cert_with_spiffe(&keypair, spiffe_config)?;
-        let (client_certs, client_key) = generate_ed25519_cert_with_spiffe(&keypair, spiffe_config)?;
+        let (server_certs, server_key) = match spiffe_config {
+            Some(cfg) => generate_ed25519_cert_with_spiffe(&keypair, Some(cfg))?,
+            None => generate_ed25519_cert(&keypair)?,
+        };
+        let (client_certs, client_key) = match spiffe_config {
+            Some(cfg) => generate_ed25519_cert_with_spiffe(&keypair, Some(cfg))?,
+            None => generate_ed25519_cert(&keypair)?,
+        };
         
         let server_config = create_server_config(server_certs, server_key)?;
         let client_config = create_client_config(client_certs, client_key)?;
@@ -1284,13 +1289,12 @@ impl Node {
         let dhtnode = self.dhtnode.clone();
         let my_frost_id = signer_state.identifier();
         
+        // Type alias for pending request data: (tbs, nonce, commitment, created_at, requester)
+        type PendingRequest = (Vec<u8>, crate::thresholdca::SigningNonce, Vec<u8>, Instant, Identity);
+        
         let handle = tokio::spawn(async move {
-            // Track pending requests with bounded capacity and timestamps:
-            // request_id -> (tbs, nonce, commitment, created_at, requester_identity)
-            let mut pending: LruCache<
-                [u8; 32],
-                (Vec<u8>, crate::thresholdca::SigningNonce, Vec<u8>, Instant, Identity),
-            > = LruCache::new(
+            // Track pending requests with bounded capacity and timestamps
+            let mut pending: LruCache<[u8; 32], PendingRequest> = LruCache::new(
                 NonZeroUsize::new(MAX_PENDING_REQUESTS)
                     .expect("MAX_PENDING_REQUESTS must be non-zero")
             );
@@ -1388,7 +1392,7 @@ impl Node {
                         // Store for later signing (with timestamp and requester identity for validation)
                         pending.put(
                             request.request_id,
-                            (request.tbs_certificate.clone(), nonce, commitment_bytes.clone(), Instant::now(), request.requester.clone()),
+                            (request.tbs_certificate.clone(), nonce, commitment_bytes.clone(), Instant::now(), request.requester),
                         );
                         
                         // Resolve requester's contact
@@ -1615,18 +1619,17 @@ async fn request_ca_certificate(
             Ok(Some((from_hex, data, response_tx))) => {
                 // Try to parse as commitment response
                 // SECURITY: Use deserialize_bounded to prevent OOM from malicious signers
-                if let Ok(commitment) = crate::messages::deserialize_bounded::<CaCommitmentResponse>(&data) {
-                    if commitment.request_id == request_id {
-                        if !commitments.iter().any(|(id, _)| *id == commitment.frost_id) {
-                            commitments.push((commitment.frost_id, commitment.commitment));
-                            signer_contacts.push((commitment.frost_id, from_hex.clone()));
-                            debug!(
-                                frost_id = ?commitment.frost_id,
-                                count = commitments.len(),
-                                "Received commitment"
-                            );
-                        }
-                    }
+                if let Ok(commitment) = crate::messages::deserialize_bounded::<CaCommitmentResponse>(&data)
+                    && commitment.request_id == request_id
+                    && !commitments.iter().any(|(id, _)| *id == commitment.frost_id)
+                {
+                    commitments.push((commitment.frost_id, commitment.commitment));
+                    signer_contacts.push((commitment.frost_id, from_hex.clone()));
+                    debug!(
+                        frost_id = ?commitment.frost_id,
+                        count = commitments.len(),
+                        "Received commitment"
+                    );
                 }
                 // Ack the RPC (empty response for commitment phase)
                 let _ = response_tx.send(vec![]);
@@ -1673,15 +1676,15 @@ async fn request_ca_certificate(
         match node.send(identity_hex, sign_request_data.clone()).await {
             Ok(response_data) => {
                 // SECURITY: Use deserialize_bounded to prevent OOM from malicious signers
-                if let Ok(response) = crate::messages::deserialize_bounded::<CaSignResponse>(&response_data) {
-                    if response.request_id == request_id && response.frost_id == *frost_id {
-                        shares.push((response.frost_id, response.share));
-                        debug!(
-                            frost_id = ?frost_id,
-                            count = shares.len(),
-                            "Received signature share"
-                        );
-                    }
+                if let Ok(response) = crate::messages::deserialize_bounded::<CaSignResponse>(&response_data)
+                    && response.request_id == request_id && response.frost_id == *frost_id
+                {
+                    shares.push((response.frost_id, response.share));
+                    debug!(
+                        frost_id = ?frost_id,
+                        count = shares.len(),
+                        "Received signature share"
+                    );
                 }
             }
             Err(e) => {
