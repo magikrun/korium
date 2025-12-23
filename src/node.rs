@@ -73,11 +73,13 @@ type RequestTuple = (
 pub use crate::identity::{Identity, IdentityProof, PoWError, POW_DIFFICULTY};
 
 // Re-export Threshold CA types for public API consumers
+// Note: DKG types (DkgCoordinator, DkgRound1Secret, etc.) are internal.
+// Users should generate SignerState via external tooling or the korium CLI.
 #[cfg(feature = "spiffe")]
 pub use crate::thresholdca::{
     CaPublicKey, SignerState, ThresholdCaConfig, ThresholdCaError,
-    DkgCoordinator, DkgRound1Secret, DkgRound2Secret, DkgMessage,
 };
+// CaRequestConfig is defined in this module, not thresholdca
 
 pub struct Node {
     keypair: Keypair,

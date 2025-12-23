@@ -62,15 +62,6 @@ pub const DKG_ROUND_TIMEOUT_SECS: u64 = 30;
 /// Timeout for collecting signature shares.
 pub const SIGNING_TIMEOUT_SECS: u64 = 10;
 
-/// GossipSub topic for signer announcements.
-pub const TOPIC_CA_SIGNERS: &str = "ca/signers";
-
-/// GossipSub topic for DKG round 1 packages.
-pub const TOPIC_DKG_ROUND1: &str = "ca/dkg/round1";
-
-/// GossipSub topic for DKG round 2 packages.
-pub const TOPIC_DKG_ROUND2: &str = "ca/dkg/round2";
-
 /// GossipSub topic for CSR broadcast.
 pub const TOPIC_CSR: &str = "csr";
 

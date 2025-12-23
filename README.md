@@ -24,7 +24,7 @@ Add Korium to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-korium = "0.1"
+korium = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -166,6 +166,7 @@ while let Some(incoming) = rx.recv().await {
 | `identity` | Keypairs, endpoint records, and signed address publication |
 | `protocols` | Protocol trait definitions (DhtNodeRpc, GossipSubRpc, RelayRpc, PlainRpc) |
 | `messages` | Protocol message types and bounded serialization |
+| `thresholdca` | FROST threshold CA (K-of-N signing) — requires `spiffe` feature |
 
 ## Core Concepts
 
@@ -489,30 +490,14 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### Extracting SPIFFE IDs
-
-```rust
-use korium::{extract_spiffe_id_from_cert, validate_spiffe_id};
-
-// From an X.509 certificate (DER bytes)
-if let Some(spiffe_id) = extract_spiffe_id_from_cert(&cert_der)? {
-    println!("SPIFFE ID: {}", spiffe_id);
-    
-    // Validate format and extract identity
-    let identity = validate_spiffe_id(&spiffe_id, "production.example.com")?;
-    println!("Verified identity: {}", hex::encode(&identity.0));
-}
-```
-
 ### SPIFFE API
 
-| Function | Description |
-|----------|-------------|
-| `SpiffeConfig::new(trust_domain, workload_path)` | Create SPIFFE configuration |
-| `SpiffeConfig::spiffe_id(&self, identity)` | Generate full SPIFFE URI |
-| `generate_ed25519_cert_with_spiffe(keypair, spiffe_config)` | Generate certificate with URI SAN |
-| `extract_spiffe_id_from_cert(der)` | Extract SPIFFE ID from certificate |
-| `validate_spiffe_id(spiffe_id, trust_domain)` | Validate and extract Identity |
+| Method | Description |
+|--------|-------------|
+| `NodeBuilder::spiffe_trust_domain(domain)` | Set the SPIFFE trust domain |
+| `NodeBuilder::spiffe_workload_path(path)` | Set optional workload path suffix |
+
+Certificates with SPIFFE URI SANs are generated automatically when building a node with `spiffe_trust_domain()` set.
 
 ### Verification Without a CA
 
@@ -558,9 +543,8 @@ if let Some(spiffe_id) = extract_spiffe_id_from_cert(&peer_cert)? {
 ### Security Considerations
 
 - **Cryptographic Binding:** The identity hex is embedded in the SPIFFE URI path, ensuring the SPIFFE ID cannot be forged independently of the Ed25519 keypair
-- **Trust Domain Validation:** `validate_spiffe_id()` enforces trust domain matching to prevent cross-domain impersonation
 - **No Central Authority:** Unlike standard SPIFFE deployments, Korium nodes self-issue certificates—the SPIFFE ID provides format compatibility, not centralized trust
-- **Zero Runtime Cost:** When the `spiffe-compat` feature is disabled, no SPIFFE code is compiled
+- **Zero Runtime Cost:** When the `spiffe` feature is disabled, no SPIFFE code is compiled
 - **No Revocation Infrastructure:** Without a CA, certificate revocation relies on DHT record expiry and GossipSub peer scoring—nodes with bad behavior are deprioritized, not revoked
 
 ## Threshold CA
@@ -620,31 +604,6 @@ let signer_state: SignerState = coordinator.round3(
 
 // Persist signer_state (contains private key share - encrypt at rest!)
 let serialized = signer_state.serialize()?;
-```
-
-### Signing Certificates
-
-```rust
-use korium::{
-    SigningRequest, generate_signing_commitment, sign_with_share, aggregate_signatures
-};
-
-// Requester creates signing request
-let request = SigningRequest::new(tbs_certificate, my_identity);
-broadcast_to_signers(request);
-
-// Each signer generates commitment and partial signature
-let (nonce, commitment) = generate_signing_commitment(&signer_state)?;
-// ... collect commitments from K signers ...
-let share = sign_with_share(&signer_state, nonce, &request.tbs_certificate, &commitments)?;
-
-// Requester aggregates K shares into valid signature
-let signature = aggregate_signatures(
-    &pubkey_package,
-    &request.tbs_certificate,
-    &commitments,
-    &shares,
-)?;
 ```
 
 ### Node Integration
@@ -713,18 +672,15 @@ let cert_der = node.request_ca_certificate_from_mesh("example.org", Some("api-gw
 
 | Type/Function | Description |
 |---------------|-------------|
-| `ThresholdCaConfig` | Configuration (N signers, K threshold, trust domain) |
-| `DkgCoordinator` | Runs the 3-round DKG protocol |
-| `SignerState` | Holds private key share (serialize for persistence) |
+| `SignerState` | Holds private key share (generated externally, serialize for persistence) |
 | `CaPublicKey` | Distributable CA public key |
 | `CaRequestConfig` | Configuration for requesting CA-signed certificates |
+| `ThresholdCaConfig` | Configuration (N signers, K threshold, trust domain) |
+| `ThresholdCaError` | Error type for threshold CA operations |
 | `NodeBuilder::as_ca_signer()` | Configure node as CA signer |
 | `Node::request_ca_certificate_from_mesh()` | Request CA-signed certificate |
-| `generate_csr()` | Create TBS certificate with SPIFFE SAN |
-| `generate_signing_commitment()` | Signer's per-request commitment |
-| `sign_with_share()` | Produce partial signature |
-| `aggregate_signatures()` | Combine K partials into signature |
-| `verify_tbs_signature()` | Verify against CA public key |
+
+> **Note:** DKG (Distributed Key Generation) is an internal implementation detail. Generate `SignerState` via external tooling or the Korium CLI.
 
 ### Security Properties
 
@@ -739,10 +695,7 @@ let cert_der = node.request_ca_certificate_from_mesh("example.org", Some("api-gw
 ### GossipSub Topics (Threshold CA)
 
 | Topic | Purpose |
-|-------|---------|
-| `ca/signers` | Signer presence announcements |
-| `ca/dkg/round1` | DKG round 1 packages |
-| `ca/dkg/round2` | DKG round 2 packages |
+|-------|--------|
 | `csr` | Certificate signing request broadcast |
 
 > **Note:** Commitments and signature shares are exchanged via RPC (point-to-point), not GossipSub, for privacy and efficiency.

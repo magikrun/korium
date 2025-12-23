@@ -56,10 +56,10 @@ pub use node::{Identity, IdentityProof, PoWError, POW_DIFFICULTY, Node, NodeBuil
 
 // SPIFFE and Threshold CA types are accessed through Node's public API:
 // - Node::builder().spiffe_trust_domain() / .spiffe_workload_path()
+// - Node::builder().as_ca_signer(signer_state)
 // - Node::request_ca_certificate_from_mesh()
-// - Node::start_ca_signer()
+// DKG types are internal - generate SignerState via external tooling.
 #[cfg(feature = "spiffe")]
 pub use node::{
     CaRequestConfig, CaPublicKey, SignerState, ThresholdCaConfig, ThresholdCaError,
-    DkgCoordinator, DkgRound1Secret, DkgRound2Secret, DkgMessage,
 };
