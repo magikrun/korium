@@ -1,6 +1,6 @@
 [package]
 name = "korium"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Batteries-included adaptive networking fabric"
 license = "MIT"
@@ -14,6 +14,10 @@ authors = ["Flavio Aiello"]
 default = []
 # Reduced PoW difficulty for faster tests. NEVER use in production.
 test-pow = []
+# Enables SPIFFE-compatible X.509 SAN URIs and distributed threshold CA.
+# Includes: SPIFFE ID generation/extraction, FROST K-of-N threshold signatures.
+# Does NOT change Korium's identity model - adds enterprise interoperability layer.
+spiffe = ["frost-ed25519"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -34,6 +38,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.12"
 bincode = "1.3"
 getrandom = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# Threshold CA (FROST signatures)
+frost-ed25519 = { version = "2.2", optional = true }
 
 [dev-dependencies]
 korium = { path = ".", features = ["test-pow"] }

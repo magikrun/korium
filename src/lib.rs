@@ -49,4 +49,17 @@ mod relay;
 mod rpc;
 mod transport;
 
-pub use node::{Identity, IdentityProof, PoWError, POW_DIFFICULTY, Node};
+#[cfg(feature = "spiffe")]
+mod thresholdca;
+
+pub use node::{Identity, IdentityProof, PoWError, POW_DIFFICULTY, Node, NodeBuilder};
+
+// SPIFFE and Threshold CA types are accessed through Node's public API:
+// - Node::builder().spiffe_trust_domain() / .spiffe_workload_path()
+// - Node::request_ca_certificate_from_mesh()
+// - Node::start_ca_signer()
+#[cfg(feature = "spiffe")]
+pub use node::{
+    CaRequestConfig, CaPublicKey, SignerState, ThresholdCaConfig, ThresholdCaError,
+    DkgCoordinator, DkgRound1Secret, DkgRound2Secret, DkgMessage,
+};

@@ -360,16 +360,19 @@ impl DirectPeerIpLimiter {
 
     /// Check if a direct peer from the given IP should be allowed.
     /// Extracts IP from the contact's primary address.
+    /// 
+    /// # Security
+    /// Fail-closed: Unparseable addresses are denied (prevents bypass via malformed contacts).
     pub fn allow_direct_peer(&mut self, contact: &Contact) -> bool {
         let ip = match contact.primary_addr() {
             Some(addr_str) => {
                 // Parse "host:port" format
                 match addr_str.parse::<std::net::SocketAddr>() {
                     Ok(addr) => addr.ip(),
-                    Err(_) => return true, // Can't parse, allow (fail-open for edge cases)
+                    Err(_) => return false, // SECURITY: Fail-closed - unparseable = deny
                 }
             }
-            None => return true, // No address, allow (unusual but not attackable)
+            None => return false, // SECURITY: Fail-closed - no address = deny
         };
         
         let bucket = self.buckets.get_or_insert_mut(ip, DirectPeerIpBucket::new);

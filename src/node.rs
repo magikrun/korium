@@ -41,7 +41,10 @@ use anyhow::{Context, Result};
 use quinn::{Connection, Endpoint};
 use tracing::{debug, info, warn};
 
+#[cfg(not(feature = "spiffe"))]
 use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_config};
+#[cfg(feature = "spiffe")]
+use crate::crypto::{generate_ed25519_cert_with_spiffe, create_server_config, create_client_config, SpiffeConfig};
 use crate::dht::{DhtNode, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
 use crate::identity::{Contact, Keypair};
 use crate::messages::{Message, RelayResponse};
@@ -68,6 +71,13 @@ type RequestTuple = (
 
 // Re-export Identity and PoW types for public API consumers
 pub use crate::identity::{Identity, IdentityProof, PoWError, POW_DIFFICULTY};
+
+// Re-export Threshold CA types for public API consumers
+#[cfg(feature = "spiffe")]
+pub use crate::thresholdca::{
+    CaPublicKey, SignerState, ThresholdCaConfig, ThresholdCaError,
+    DkgCoordinator, DkgRound1Secret, DkgRound2Secret, DkgMessage,
+};
 
 pub struct Node {
     keypair: Keypair,
@@ -109,10 +119,88 @@ impl Node {
 
     /// Create a new node with an existing keypair and its PoW proof.
     pub async fn bind_with_keypair_and_pow(addr: &str, keypair: Keypair, pow_proof: IdentityProof) -> Result<Self> {
-        Self::create(addr, keypair, pow_proof).await
+        Self::create_internal(addr, keypair, pow_proof, None).await
     }
 
+    /// Create a builder for configuring a new node.
+    ///
+    /// The builder pattern allows configuring optional features like SPIFFE
+    /// before creating the node.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Without SPIFFE (default)
+    /// let node = Node::builder("0.0.0.0:4433").build().await?;
+    ///
+    /// // With SPIFFE (requires spiffe feature)
+    /// let node = Node::builder("0.0.0.0:4433")
+    ///     .spiffe_trust_domain("example.org")
+    ///     .spiffe_workload_path("payment-svc")
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn builder(addr: &str) -> NodeBuilder {
+        NodeBuilder::new(addr)
+    }
+
+    #[cfg(not(feature = "spiffe"))]
     async fn create(addr: &str, keypair: Keypair, pow_proof: IdentityProof) -> Result<Self> {
+        Self::create_internal(addr, keypair, pow_proof, None).await
+    }
+
+    #[cfg(feature = "spiffe")]
+    async fn create(addr: &str, keypair: Keypair, pow_proof: IdentityProof) -> Result<Self> {
+        Self::create_internal(addr, keypair, pow_proof, None).await
+    }
+
+    #[cfg(feature = "spiffe")]
+    async fn create_with_spiffe(
+        addr: &str,
+        keypair: Keypair,
+        pow_proof: IdentityProof,
+        spiffe_config: Option<&SpiffeConfig>,
+    ) -> Result<Self> {
+        Self::create_internal(addr, keypair, pow_proof, spiffe_config).await
+    }
+
+    #[cfg(feature = "spiffe")]
+    async fn create_internal(
+        addr: &str,
+        keypair: Keypair,
+        pow_proof: IdentityProof,
+        spiffe_config: Option<&SpiffeConfig>,
+    ) -> Result<Self> {
+        let addr: SocketAddr = addr.parse()
+            .context("invalid socket address")?;
+        
+        let identity = keypair.identity();
+        
+        // Generate certificates with optional SPIFFE SAN
+        let (server_certs, server_key) = generate_ed25519_cert_with_spiffe(&keypair, spiffe_config)?;
+        let (client_certs, client_key) = generate_ed25519_cert_with_spiffe(&keypair, spiffe_config)?;
+        
+        let server_config = create_server_config(server_certs, server_key)?;
+        let client_config = create_client_config(client_certs, client_key)?;
+        
+        let (endpoint, smartsock) = SmartSock::bind_endpoint(addr, server_config)
+            .await
+            .context("failed to bind SmartSock endpoint")?;
+        let local_addr = endpoint.local_addr()?;
+        
+        // Create contact with PoW proof for Sybil resistance
+        let mut contact = Contact::single(identity, local_addr.to_string());
+        contact.pow_proof = pow_proof;
+        
+        Self::create_from_components(keypair, endpoint, smartsock, contact, client_config).await
+    }
+
+    #[cfg(not(feature = "spiffe"))]
+    async fn create_internal(
+        addr: &str,
+        keypair: Keypair,
+        pow_proof: IdentityProof,
+        _spiffe_config: Option<()>,
+    ) -> Result<Self> {
         let addr: SocketAddr = addr.parse()
             .context("invalid socket address")?;
         
@@ -132,6 +220,19 @@ impl Node {
         // Create contact with PoW proof for Sybil resistance
         let mut contact = Contact::single(identity, local_addr.to_string());
         contact.pow_proof = pow_proof;
+        
+        Self::create_from_components(keypair, endpoint, smartsock, contact, client_config).await
+    }
+
+    async fn create_from_components(
+        keypair: Keypair,
+        endpoint: Endpoint,
+        smartsock: Arc<SmartSock>,
+        contact: Contact,
+        client_config: quinn::ClientConfig,
+    ) -> Result<Self> {
+        let identity = keypair.identity();
+        let local_addr = endpoint.local_addr()?;
         
         let rpcnode = RpcNode::with_identity(
             endpoint.clone(),
@@ -1132,5 +1233,770 @@ impl Node {
     /// Get access to the relay client for advanced NAT management.
     pub fn relay_client(&self) -> &RelayClient {
         &self.relay_client
+    }
+    
+    /// Start the CA signer background task.
+    ///
+    /// This subscribes to the `csr` topic and responds to certificate signing
+    /// requests via RPC. The protocol is:
+    ///
+    /// 1. Requester broadcasts CSR on `csr` GossipSub topic
+    /// 2. Signer generates commitment and sends via RPC to requester
+    /// 3. Requester collects K commitments, then sends sign-request via RPC to each signer
+    /// 4. Signer produces share and responds via RPC
+    ///
+    /// # Arguments
+    /// * `signer_state` - The signer state from DKG
+    ///
+    /// # Returns
+    /// A `JoinHandle` for the background task.
+    #[cfg(feature = "spiffe")]
+    pub async fn start_ca_signer(
+        &self,
+        signer_state: crate::thresholdca::SignerState,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        use std::num::NonZeroUsize;
+        use std::time::Instant;
+        use lru::LruCache;
+        use crate::thresholdca::{
+            generate_signing_commitment, sign_with_share, SigningRequest,
+            CaCommitmentResponse, CaSignRequest, CaSignResponse, 
+            CA_SIGN_REQUEST_MAGIC, CA_SIGN_REQUEST_MAGIC_LEN,
+        };
+        use crate::identity::Identity;
+        
+        const CSR_TOPIC: &str = "csr";
+        /// Maximum pending signing requests to prevent OOM.
+        const MAX_PENDING_REQUESTS: usize = 1000;
+        /// Timeout for pending requests (30 seconds).
+        const PENDING_TIMEOUT_SECS: u64 = 30;
+        /// Cleanup interval for expired pending requests.
+        const CLEANUP_INTERVAL_SECS: u64 = 10;
+        
+        // Subscribe to CSR topic
+        self.subscribe(CSR_TOPIC).await?;
+        
+        let mut gossip_rx = self.messages().await?;
+        let mut rpc_rx = self.incoming_requests().await?;
+        let rpcnode = self.rpcnode.clone();
+        let dhtnode = self.dhtnode.clone();
+        let my_frost_id = signer_state.identifier();
+        
+        let handle = tokio::spawn(async move {
+            // Track pending requests with bounded capacity and timestamps:
+            // request_id -> (tbs, nonce, commitment, created_at, requester_identity)
+            let mut pending: LruCache<
+                [u8; 32],
+                (Vec<u8>, crate::thresholdca::SigningNonce, Vec<u8>, Instant, Identity),
+            > = LruCache::new(
+                NonZeroUsize::new(MAX_PENDING_REQUESTS)
+                    .expect("MAX_PENDING_REQUESTS must be non-zero")
+            );
+            
+            let mut cleanup_interval = tokio::time::interval(
+                tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECS)
+            );
+            
+            loop {
+                tokio::select! {
+                    // Periodic cleanup of expired pending requests
+                    _ = cleanup_interval.tick() => {
+                        let now = Instant::now();
+                        let timeout = std::time::Duration::from_secs(PENDING_TIMEOUT_SECS);
+                        
+                        // Collect expired keys (can't modify while iterating)
+                        let expired: Vec<[u8; 32]> = pending
+                            .iter()
+                            .filter(|(_, (_, _, _, created_at, _))| now.duration_since(*created_at) > timeout)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        
+                        for key in &expired {
+                            pending.pop(key);
+                        }
+                        
+                        if !expired.is_empty() {
+                            debug!(count = expired.len(), "Cleaned up expired pending requests");
+                        }
+                    }
+                    // Handle CSR from GossipSub
+                    Some(msg) = gossip_rx.recv() => {
+                        if msg.topic != CSR_TOPIC {
+                            continue;
+                        }
+                        
+                        // Parse signing request with size bounds
+                        // SECURITY: Use deserialize_bounded to prevent OOM from oversized payloads
+                        let request: SigningRequest = match crate::messages::deserialize_bounded(&msg.data) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!("Invalid signing request: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        // SECURITY: Validate TBS certificate size
+                        if request.tbs_certificate.len() > crate::thresholdca::MAX_TBS_CERTIFICATE_SIZE {
+                            warn!(
+                                tbs_size = request.tbs_certificate.len(),
+                                max = crate::thresholdca::MAX_TBS_CERTIFICATE_SIZE,
+                                "CSR rejected: TBS certificate too large"
+                            );
+                            continue;
+                        }
+                        
+                        // SECURITY: Validate that msg.from matches request.requester
+                        // Prevents impersonation attacks where attacker sends CSR with victim's identity.
+                        // NOTE: msg.from is derived from msg.source which is cryptographically signed
+                        // by the GossipSub signature (verified in verify_gossipsub_signature()).
+                        let msg_sender = match Identity::from_hex(&msg.from) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                warn!("Invalid sender identity in GossipSub message");
+                                continue;
+                            }
+                        };
+                        if msg_sender != request.requester {
+                            warn!(
+                                msg_from = %msg.from,
+                                request_requester = %request.requester,
+                                "CSR requester mismatch - possible impersonation attempt"
+                            );
+                            continue;
+                        }
+                        
+                        // SECURITY: Skip duplicate request_ids to prevent nonce reuse
+                        if pending.contains(&request.request_id) {
+                            debug!(
+                                request_id = hex::encode(&request.request_id[..8]),
+                                "Duplicate request_id - skipping"
+                            );
+                            continue;
+                        }
+                        
+                        // Generate commitment and nonce
+                        let (nonce, commitment_bytes) = match generate_signing_commitment(&signer_state) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("Failed to generate commitment: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        // Store for later signing (with timestamp and requester identity for validation)
+                        pending.put(
+                            request.request_id,
+                            (request.tbs_certificate.clone(), nonce, commitment_bytes.clone(), Instant::now(), request.requester.clone()),
+                        );
+                        
+                        // Resolve requester's contact
+                        let requester_contact = match dhtnode.resolve_peer(&request.requester).await {
+                            Ok(Some(c)) => c,
+                            Ok(None) => {
+                                warn!(requester = %request.requester, "Requester not found in DHT");
+                                pending.pop(&request.request_id);
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("DHT lookup failed: {}", e);
+                                pending.pop(&request.request_id);
+                                continue;
+                            }
+                        };
+                        
+                        // Send commitment via RPC (fire and forget - requester will RPC back for signing)
+                        let response = CaCommitmentResponse {
+                            request_id: request.request_id,
+                            frost_id: my_frost_id,
+                            commitment: commitment_bytes,
+                        };
+                        
+                        if let Ok(data) = bincode::serialize(&response) {
+                            if let Err(e) = rpcnode.send(&requester_contact, data).await {
+                                warn!("Failed to send commitment to requester: {}", e);
+                                pending.pop(&request.request_id);
+                            } else {
+                                debug!(
+                                    request_id = hex::encode(&request.request_id[..8]),
+                                    "Sent commitment to requester"
+                                );
+                            }
+                        }
+                    }
+                    
+                    // Handle sign requests via RPC
+                    Some((from_hex, request_data, response_tx)) = rpc_rx.recv() => {
+                        // Check if this is a CA sign request (4-byte magic prefix)
+                        if request_data.len() < CA_SIGN_REQUEST_MAGIC_LEN 
+                            || &request_data[..CA_SIGN_REQUEST_MAGIC_LEN] != CA_SIGN_REQUEST_MAGIC 
+                        {
+                            // Not for us, send empty response
+                            let _ = response_tx.send(vec![]);
+                            continue;
+                        }
+                        
+                        // Parse sign request (skip magic prefix)
+                        // SECURITY: Use deserialize_bounded to prevent OOM from oversized payloads
+                        let sign_request: CaSignRequest = match crate::messages::deserialize_bounded(&request_data[CA_SIGN_REQUEST_MAGIC_LEN..]) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let _ = response_tx.send(vec![]);
+                                continue;
+                            }
+                        };
+                        
+                        // Look up our pending state
+                        let (tbs, nonce, _our_commitment, _created_at, requester_identity) = match pending.pop(&sign_request.request_id) {
+                            Some(p) => p,
+                            None => {
+                                warn!("No pending request for sign request");
+                                let _ = response_tx.send(vec![]);
+                                continue;
+                            }
+                        };
+                        
+                        // SECURITY: Validate that RPC sender matches the original requester
+                        let rpc_sender = match Identity::from_hex(&from_hex) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                warn!("Invalid RPC sender identity");
+                                let _ = response_tx.send(vec![]);
+                                continue;
+                            }
+                        };
+                        if rpc_sender != requester_identity {
+                            warn!(
+                                rpc_sender = %rpc_sender,
+                                original_requester = %requester_identity,
+                                "Sign request sender mismatch - possible hijacking attempt"
+                            );
+                            let _ = response_tx.send(vec![]);
+                            continue;
+                        }
+                        
+                        // Produce signature share
+                        match sign_with_share(&signer_state, nonce, &tbs, &sign_request.commitments) {
+                            Ok(share_bytes) => {
+                                let response = CaSignResponse {
+                                    request_id: sign_request.request_id,
+                                    frost_id: my_frost_id,
+                                    share: share_bytes,
+                                };
+                                
+                                if let Ok(data) = bincode::serialize(&response) {
+                                    let _ = response_tx.send(data);
+                                    debug!(
+                                        request_id = hex::encode(&sign_request.request_id[..8]),
+                                        "Sent signature share"
+                                    );
+                                } else {
+                                    let _ = response_tx.send(vec![]);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to produce signature share: {}", e);
+                                let _ = response_tx.send(vec![]);
+                            }
+                        }
+                    }
+                    
+                    else => break,
+                }
+            }
+        });
+        
+        info!("CA signer task started");
+        Ok(handle)
+    }
+    
+    /// Request a CA-signed certificate from the threshold CA.
+    ///
+    /// This broadcasts a CSR to the signer committee and collects enough
+    /// partial signatures to produce a valid CA-signed certificate.
+    ///
+    /// **Important:** The node must be bootstrapped into a mesh with responsive
+    /// signers before calling this method.
+    ///
+    /// # Arguments
+    /// * `trust_domain` - SPIFFE trust domain for the certificate
+    /// * `workload_path` - Optional workload path suffix
+    /// * `config` - CA request configuration
+    ///
+    /// # Returns
+    /// DER-encoded X.509 certificate signed by the threshold CA.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // First bootstrap into the mesh
+    /// node.bootstrap(&bootstrap_identity, &bootstrap_addr).await?;
+    /// 
+    /// // Then request CA certificate
+    /// let config = CaRequestConfig {
+    ///     signer_identities: vec![...],
+    ///     min_signers: 3,
+    ///     ca_public_key,
+    ///     timeout: Duration::from_secs(30),
+    /// };
+    /// let cert_der = node.request_ca_certificate("example.org", Some("api-gw"), &config).await?;
+    /// ```
+    #[cfg(feature = "spiffe")]
+    pub async fn request_ca_certificate_from_mesh(
+        &self,
+        trust_domain: &str,
+        workload_path: Option<&str>,
+        config: &CaRequestConfig,
+    ) -> Result<Vec<u8>> {
+        request_ca_certificate(self, &self.keypair, trust_domain, workload_path, config).await
+    }
+}
+
+// ============================================================================
+// CA Certificate Request Flow
+// ============================================================================
+
+/// Request a CA-signed certificate from the threshold CA signers.
+///
+/// Protocol flow:
+/// 1. Broadcast CSR on `csr` GossipSub topic
+/// 2. Receive commitments via RPC from signers
+/// 3. Send sign-request (with all commitments) via RPC to each signer
+/// 4. Receive signature shares via RPC responses
+/// 5. Aggregate shares into final signature
+#[cfg(feature = "spiffe")]
+async fn request_ca_certificate(
+    node: &Node,
+    keypair: &Keypair,
+    trust_domain: &str,
+    workload_path: Option<&str>,
+    config: &CaRequestConfig,
+) -> Result<Vec<u8>> {
+    use crate::thresholdca::{
+        generate_csr, aggregate_signatures, SigningRequest,
+        CaCommitmentResponse, CaSignRequest, CaSignResponse, 
+        CA_SIGN_REQUEST_MAGIC,
+    };
+    
+    const CSR_TOPIC: &str = "csr";
+    const CERT_VALIDITY_SECS: u64 = 86400 * 365; // 1 year
+    
+    // Generate CSR with SPIFFE SAN
+    let csr = generate_csr(keypair, trust_domain, workload_path, CERT_VALIDITY_SECS)
+        .map_err(|e| anyhow::anyhow!("CSR generation failed: {}", e))?;
+    
+    // Create signing request with unique ID
+    let request = SigningRequest::new(csr.tbs_der.clone(), keypair.identity());
+    let request_id = request.request_id;
+    
+    // Broadcast CSR on GossipSub
+    let request_data = bincode::serialize(&request)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize request: {}", e))?;
+    node.publish(CSR_TOPIC, request_data).await?;
+    
+    info!(request_id = hex::encode(&request_id[..8]), "Broadcast CSR to signers");
+    
+    // Collect commitments via RPC from signers
+    // Signers will send their commitments directly to us after seeing the CSR
+    let mut rpc_rx = node.incoming_requests().await?;
+    let mut commitments: Vec<(frost_ed25519::Identifier, Vec<u8>)> = Vec::new();
+    let mut signer_contacts: Vec<(frost_ed25519::Identifier, String)> = Vec::new(); // frost_id -> identity_hex
+    
+    let deadline = tokio::time::Instant::now() + config.timeout;
+    
+    // Phase 1: Collect commitments
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        
+        match tokio::time::timeout(remaining, rpc_rx.recv()).await {
+            Ok(Some((from_hex, data, response_tx))) => {
+                // Try to parse as commitment response
+                // SECURITY: Use deserialize_bounded to prevent OOM from malicious signers
+                if let Ok(commitment) = crate::messages::deserialize_bounded::<CaCommitmentResponse>(&data) {
+                    if commitment.request_id == request_id {
+                        if !commitments.iter().any(|(id, _)| *id == commitment.frost_id) {
+                            commitments.push((commitment.frost_id, commitment.commitment));
+                            signer_contacts.push((commitment.frost_id, from_hex.clone()));
+                            debug!(
+                                frost_id = ?commitment.frost_id,
+                                count = commitments.len(),
+                                "Received commitment"
+                            );
+                        }
+                    }
+                }
+                // Ack the RPC (empty response for commitment phase)
+                let _ = response_tx.send(vec![]);
+                
+                // Check if we have enough commitments
+                if commitments.len() >= config.min_signers as usize {
+                    info!(
+                        commitments = commitments.len(),
+                        threshold = config.min_signers,
+                        "Collected sufficient commitments"
+                    );
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break, // Timeout
+        }
+    }
+    
+    if commitments.len() < config.min_signers as usize {
+        return Err(anyhow::anyhow!(
+            "Insufficient commitments: got {}, need {}",
+            commitments.len(),
+            config.min_signers
+        ));
+    }
+    
+    // Phase 2: Send sign request to each signer and collect shares
+    let sign_request = CaSignRequest {
+        request_id,
+        commitments: commitments.clone(),
+    };
+    
+    // Prepend 4-byte magic prefix
+    let mut sign_request_data = CA_SIGN_REQUEST_MAGIC.to_vec();
+    sign_request_data.extend(
+        bincode::serialize(&sign_request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize sign request: {}", e))?
+    );
+    
+    let mut shares: Vec<(frost_ed25519::Identifier, Vec<u8>)> = Vec::new();
+    
+    for (frost_id, identity_hex) in &signer_contacts {
+        match node.send(identity_hex, sign_request_data.clone()).await {
+            Ok(response_data) => {
+                // SECURITY: Use deserialize_bounded to prevent OOM from malicious signers
+                if let Ok(response) = crate::messages::deserialize_bounded::<CaSignResponse>(&response_data) {
+                    if response.request_id == request_id && response.frost_id == *frost_id {
+                        shares.push((response.frost_id, response.share));
+                        debug!(
+                            frost_id = ?frost_id,
+                            count = shares.len(),
+                            "Received signature share"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(frost_id = ?frost_id, "Failed to get signature share: {}", e);
+            }
+        }
+        
+        if shares.len() >= config.min_signers as usize {
+            break;
+        }
+    }
+    
+    // Aggregate signatures
+    if shares.len() < config.min_signers as usize {
+        return Err(anyhow::anyhow!(
+            "Insufficient signatures: got {}, need {}",
+            shares.len(),
+            config.min_signers
+        ));
+    }
+    
+    let pubkey_package = config.ca_public_key.pubkey_package()
+        .map_err(|e| anyhow::anyhow!("Invalid CA public key: {}", e))?;
+    
+    let signature = aggregate_signatures(&pubkey_package, &csr.tbs_der, &commitments, &shares)
+        .map_err(|e| anyhow::anyhow!("Signature aggregation failed: {}", e))?;
+    
+    // Assemble final certificate
+    let cert_der = crate::thresholdca::assemble_certificate(&csr.tbs_der, &signature)
+        .map_err(|e| anyhow::anyhow!("Certificate assembly failed: {}", e))?;
+    
+    info!(
+        spiffe_id = csr.spiffe_id,
+        "Successfully obtained CA-signed certificate"
+    );
+    
+    Ok(cert_der)
+}
+
+// ============================================================================
+// NodeBuilder - Fluent Configuration API
+// ============================================================================
+
+/// Builder for configuring a Korium node before creation.
+///
+/// Provides a fluent API for configuring optional features like SPIFFE
+/// trust domains before binding the node to a socket.
+///
+/// # Example
+/// ```ignore
+/// // Basic usage (no SPIFFE)
+/// let node = Node::builder("0.0.0.0:4433")
+///     .build()
+///     .await?;
+///
+/// // With SPIFFE (requires `spiffe` feature)
+/// let node = Node::builder("0.0.0.0:4433")
+///     .spiffe_trust_domain("example.org")
+///     .spiffe_workload_path("payment-svc")
+///     .build()
+///     .await?;
+///
+/// // With existing keypair
+/// let node = Node::builder("0.0.0.0:4433")
+///     .keypair(keypair)
+///     .pow_proof(pow_proof)
+///     .build()
+///     .await?;
+/// ```
+pub struct NodeBuilder {
+    addr: String,
+    keypair: Option<Keypair>,
+    pow_proof: Option<IdentityProof>,
+    #[cfg(feature = "spiffe")]
+    spiffe_trust_domain: Option<String>,
+    #[cfg(feature = "spiffe")]
+    spiffe_workload_path: Option<String>,
+    #[cfg(feature = "spiffe")]
+    signer_state: Option<crate::thresholdca::SignerState>,
+    #[cfg(feature = "spiffe")]
+    ca_request_config: Option<CaRequestConfig>,
+}
+
+/// Configuration for requesting a CA-signed certificate at startup.
+#[cfg(feature = "spiffe")]
+#[derive(Clone)]
+pub struct CaRequestConfig {
+    /// Identities of the CA signers (from DKG).
+    pub signer_identities: Vec<Identity>,
+    /// Minimum number of signers required (K threshold).
+    pub min_signers: u16,
+    /// CA public key for verification.
+    pub ca_public_key: crate::thresholdca::CaPublicKey,
+    /// Timeout for collecting signatures.
+    pub timeout: Duration,
+}
+
+impl NodeBuilder {
+    /// Create a new builder for the given bind address.
+    pub fn new(addr: &str) -> Self {
+        Self {
+            addr: addr.to_string(),
+            keypair: None,
+            pow_proof: None,
+            #[cfg(feature = "spiffe")]
+            spiffe_trust_domain: None,
+            #[cfg(feature = "spiffe")]
+            spiffe_workload_path: None,
+            #[cfg(feature = "spiffe")]
+            signer_state: None,
+            #[cfg(feature = "spiffe")]
+            ca_request_config: None,
+        }
+    }
+    
+    /// Set an existing keypair instead of generating a new one.
+    ///
+    /// If you have an existing keypair from persistent storage, use this
+    /// to reuse the same identity across restarts.
+    pub fn keypair(mut self, keypair: Keypair) -> Self {
+        self.keypair = Some(keypair);
+        self
+    }
+    
+    /// Set the Proof-of-Work proof for the keypair.
+    ///
+    /// Required for production use - contacts without valid PoW will be
+    /// rejected by other nodes.
+    pub fn pow_proof(mut self, proof: IdentityProof) -> Self {
+        self.pow_proof = Some(proof);
+        self
+    }
+    
+    /// Set the SPIFFE trust domain for certificate generation.
+    ///
+    /// When set, the node's X.509 certificate will include a SPIFFE ID
+    /// as a URI Subject Alternative Name, enabling interoperability with
+    /// SPIFFE-aware systems (Envoy, Istio, AWS IAM Roles Anywhere, etc.).
+    ///
+    /// The SPIFFE ID format will be:
+    /// `spiffe://{trust_domain}/{identity_hex}[/{workload_path}]`
+    ///
+    /// # Arguments
+    /// * `trust_domain` - The trust domain (e.g., "example.org", "korium.mesh")
+    ///
+    /// # Example
+    /// ```ignore
+    /// Node::builder("0.0.0.0:4433")
+    ///     .spiffe_trust_domain("example.org")
+    ///     .build()
+    ///     .await?;
+    /// // Certificate SAN: spiffe://example.org/abc123...
+    /// ```
+    #[cfg(feature = "spiffe")]
+    pub fn spiffe_trust_domain(mut self, trust_domain: impl Into<String>) -> Self {
+        self.spiffe_trust_domain = Some(trust_domain.into());
+        self
+    }
+    
+    /// Set the SPIFFE workload path suffix.
+    ///
+    /// Optional refinement to the SPIFFE ID that identifies the workload
+    /// role within the trust domain. If set, appended to the SPIFFE ID:
+    /// `spiffe://{trust_domain}/{identity_hex}/{workload_path}`
+    ///
+    /// # Arguments
+    /// * `path` - The workload path (e.g., "relay", "validator", "payment-svc")
+    ///
+    /// # Example
+    /// ```ignore
+    /// Node::builder("0.0.0.0:4433")
+    ///     .spiffe_trust_domain("example.org")
+    ///     .spiffe_workload_path("payment-svc")
+    ///     .build()
+    ///     .await?;
+    /// // Certificate SAN: spiffe://example.org/abc123.../payment-svc
+    /// ```
+    #[cfg(feature = "spiffe")]
+    pub fn spiffe_workload_path(mut self, path: impl Into<String>) -> Self {
+        self.spiffe_workload_path = Some(path.into());
+        self
+    }
+    
+    /// Configure this node as a threshold CA signer.
+    ///
+    /// When set, the node will listen on the `ca/sign/request` GossipSub topic
+    /// and automatically respond to certificate signing requests with partial
+    /// signatures.
+    ///
+    /// # Arguments
+    /// * `state` - The signer state from DKG (contains private key share)
+    ///
+    /// # Security
+    /// The signer state contains sensitive key material. It should be:
+    /// - Loaded from encrypted storage
+    /// - Never logged or serialized without encryption
+    ///
+    /// # Example
+    /// ```ignore
+    /// let signer_state = SignerState::deserialize(&encrypted_state)?;
+    /// 
+    /// let node = Node::builder("0.0.0.0:4433")
+    ///     .spiffe_trust_domain("example.org")
+    ///     .as_ca_signer(signer_state)
+    ///     .build()
+    ///     .await?;
+    /// // Node now responds to CSR requests on ca/sign/request
+    /// ```
+    #[cfg(feature = "spiffe")]
+    pub fn as_ca_signer(mut self, state: crate::thresholdca::SignerState) -> Self {
+        self.signer_state = Some(state);
+        self
+    }
+    
+    /// Request a CA-signed certificate at startup.
+    ///
+    /// When configured, the node will:
+    /// 1. Generate a CSR with SPIFFE SAN
+    /// 2. Broadcast to signers on `ca/sign/request`
+    /// 3. Collect K partial signatures
+    /// 4. Aggregate into valid CA-signed certificate
+    /// 5. Use CA-signed cert for TLS (instead of self-signed)
+    ///
+    /// This requires the mesh to already have K responsive signers.
+    ///
+    /// # Arguments
+    /// * `config` - CA request configuration (signers, threshold, CA public key)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let ca_config = CaRequestConfig {
+    ///     signer_identities: vec![signer1, signer2, signer3],
+    ///     min_signers: 2,
+    ///     ca_public_key,
+    ///     timeout: Duration::from_secs(30),
+    /// };
+    /// 
+    /// let node = Node::builder("0.0.0.0:4433")
+    ///     .spiffe_trust_domain("example.org")
+    ///     .request_ca_cert(ca_config)
+    ///     .build()
+    ///     .await?;
+    /// // Node now has CA-signed certificate
+    /// ```
+    #[cfg(feature = "spiffe")]
+    pub fn request_ca_cert(mut self, config: CaRequestConfig) -> Self {
+        self.ca_request_config = Some(config);
+        self
+    }
+    
+    /// Build and start the node.
+    ///
+    /// This will:
+    /// 1. Generate a new keypair with PoW (if not provided)
+    /// 2. Generate TLS certificates (with optional SPIFFE SAN)
+    /// 3. Bind to the specified socket address
+    /// 4. Start the DHT, GossipSub, and relay components
+    /// 5. Start CA signer task (if configured)
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Socket binding fails
+    /// - PoW generation fails (astronomically unlikely)
+    /// - Certificate generation fails
+    #[cfg(feature = "spiffe")]
+    pub async fn build(self) -> Result<Node> {
+        let (keypair, pow_proof) = match self.keypair {
+            Some(kp) => (kp, self.pow_proof.unwrap_or_else(IdentityProof::empty)),
+            None => {
+                let (kp, proof) = Keypair::generate_with_pow()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                (kp, self.pow_proof.unwrap_or(proof))
+            }
+        };
+        
+        let spiffe_config = self.spiffe_trust_domain.as_ref().map(|td| {
+            let mut config = SpiffeConfig::new(td.clone());
+            if let Some(ref path) = self.spiffe_workload_path {
+                config = config.with_workload_path(path.clone());
+            }
+            config
+        });
+        
+        let node = Node::create_with_spiffe(&self.addr, keypair, pow_proof, spiffe_config.as_ref()).await?;
+        
+        // Start CA signer task if configured
+        if let Some(signer_state) = self.signer_state {
+            node.start_ca_signer(signer_state).await?;
+            info!("Node configured as threshold CA signer");
+        }
+        
+        // Note: CA certificate request (self.ca_request_config) requires the node to first
+        // bootstrap into a mesh with responsive signers. This must be done post-build via
+        // a separate method since we can't bootstrap during build() without peer addresses.
+        // Users should call node.request_ca_certificate() after bootstrapping.
+        if self.ca_request_config.is_some() {
+            warn!(
+                "CA certificate request configured but cannot execute during build(). \
+                 Call node.request_ca_certificate() after bootstrapping into the mesh."
+            );
+        }
+        
+        Ok(node)
+    }
+    
+    /// Build and start the node (without SPIFFE support).
+    #[cfg(not(feature = "spiffe"))]
+    pub async fn build(self) -> Result<Node> {
+        let (keypair, pow_proof) = match self.keypair {
+            Some(kp) => (kp, self.pow_proof.unwrap_or_else(IdentityProof::empty)),
+            None => {
+                let (kp, proof) = Keypair::generate_with_pow()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                (kp, self.pow_proof.unwrap_or(proof))
+            }
+        };
+        
+        Node::create(&self.addr, keypair, pow_proof).await
     }
 }

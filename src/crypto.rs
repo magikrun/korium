@@ -81,6 +81,75 @@ pub const GOSSIPSUB_SIGNATURE_DOMAIN: &[u8] = b"korium-gossipsub-v1:";
 pub const CONTACT_SIGNATURE_DOMAIN: &[u8] = b"korium-contact-v1:";
 
 // ============================================================================
+// SPIFFE Compatibility Configuration
+// ============================================================================
+
+/// Configuration for SPIFFE-compatible X.509 certificate generation.
+///
+/// When enabled, Korium certificates include a SPIFFE ID as a URI Subject
+/// Alternative Name (SAN), enabling interoperability with SPIFFE-aware systems
+/// (Envoy, Istio, AWS IAM Roles Anywhere, etc.).
+///
+/// ## Identity Binding
+///
+/// The SPIFFE ID is derived deterministically from the Korium identity:
+/// ```text
+/// spiffe://{trust_domain}/{identity_hex}[/{workload_path}]
+/// ```
+///
+/// This ensures the SPIFFE ID is cryptographically bound to the Ed25519 keypair.
+///
+/// ## Security Note
+///
+/// This does NOT change Korium's identity model:
+/// - Korium peers still authenticate via Ed25519 public key extraction
+/// - SPIFFE URI is supplementary metadata for 3rd-party integration
+/// - Trust domain is deployment configuration, not verified by Korium peers
+#[cfg(feature = "spiffe")]
+#[derive(Clone, Debug, Default)]
+pub struct SpiffeConfig {
+    /// Trust domain for SPIFFE ID (e.g., "example.org", "korium.mesh").
+    ///
+    /// Required field. The trust domain identifies the administrative boundary.
+    /// SPIFFE IDs from different trust domains are considered distinct.
+    pub trust_domain: String,
+    
+    /// Optional workload path suffix (e.g., "relay", "validator", "payment-svc").
+    ///
+    /// If provided, appended to the SPIFFE ID:
+    /// `spiffe://{trust_domain}/{identity_hex}/{workload_path}`
+    pub workload_path: Option<String>,
+}
+
+#[cfg(feature = "spiffe")]
+impl SpiffeConfig {
+    /// Create a new SPIFFE configuration with the given trust domain.
+    pub fn new(trust_domain: impl Into<String>) -> Self {
+        Self {
+            trust_domain: trust_domain.into(),
+            workload_path: None,
+        }
+    }
+    
+    /// Set the workload path suffix.
+    pub fn with_workload_path(mut self, path: impl Into<String>) -> Self {
+        self.workload_path = Some(path.into());
+        self
+    }
+    
+    /// Generate the SPIFFE ID for the given identity.
+    ///
+    /// Returns a URI in the format: `spiffe://{trust_domain}/{identity_hex}[/{workload_path}]`
+    pub fn spiffe_id(&self, identity: &crate::identity::Identity) -> String {
+        let identity_hex = hex::encode(identity.as_bytes());
+        match &self.workload_path {
+            Some(path) => format!("spiffe://{}/{}/{}", self.trust_domain, identity_hex, path),
+            None => format!("spiffe://{}/{}", self.trust_domain, identity_hex),
+        }
+    }
+}
+
+// ============================================================================
 // Domain-Separated Signature Helpers
 // ============================================================================
 
@@ -154,11 +223,78 @@ static CRYPTO_PROVIDER: std::sync::LazyLock<Arc<rustls::crypto::CryptoProvider>>
 /// accidental cross-protocol connections.
 pub const ALPN: &[u8] = b"korium";
 
+/// Generate an Ed25519 self-signed certificate for the given keypair.
+///
+/// The certificate includes:
+/// - Common Name (CN): hex-encoded public key (for debugging)
+/// - Subject Alternative Name (DNS): identity encoded for SNI compatibility
+///
+/// When the `spiffe` feature is enabled and `spiffe_config` is provided,
+/// also includes a SPIFFE ID as a URI SAN.
+#[cfg(feature = "spiffe")]
+#[allow(dead_code)] // Used by external crates and tests
 pub fn generate_ed25519_cert(
     keypair: &Keypair,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    generate_ed25519_cert_with_spiffe(keypair, None)
+}
+
+/// Generate an Ed25519 self-signed certificate without SPIFFE SAN.
+#[cfg(not(feature = "spiffe"))]
+pub fn generate_ed25519_cert(
+    keypair: &Keypair,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    generate_ed25519_cert_internal(keypair, None::<fn(&crate::identity::Identity) -> String>)
+}
+
+/// Generate an Ed25519 certificate with optional SPIFFE URI SAN.
+///
+/// When `spiffe_config` is provided, the certificate includes a SPIFFE ID
+/// as a URI Subject Alternative Name, enabling interoperability with
+/// SPIFFE-aware infrastructure (Envoy, Istio, AWS IAM Roles Anywhere, etc.).
+///
+/// # Arguments
+/// * `keypair` - The Ed25519 keypair to generate a certificate for
+/// * `spiffe_config` - Optional SPIFFE configuration for URI SAN
+///
+/// # Example
+/// ```ignore
+/// let (certs, key) = generate_ed25519_cert_with_spiffe(
+///     &keypair,
+///     Some(&SpiffeConfig::new("example.org").with_workload_path("payment-svc")),
+/// )?;
+/// // Certificate now includes: spiffe://example.org/{identity_hex}/payment-svc
+/// ```
+#[cfg(feature = "spiffe")]
+pub fn generate_ed25519_cert_with_spiffe(
+    keypair: &Keypair,
+    spiffe_config: Option<&SpiffeConfig>,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let spiffe_id_fn = spiffe_config.map(|config| {
+        let trust_domain = config.trust_domain.clone();
+        let workload_path = config.workload_path.clone();
+        move |identity: &crate::identity::Identity| -> String {
+            let identity_hex = hex::encode(identity.as_bytes());
+            match &workload_path {
+                Some(path) => format!("spiffe://{}/{}/{}", trust_domain, identity_hex, path),
+                None => format!("spiffe://{}/{}", trust_domain, identity_hex),
+            }
+        }
+    });
+    generate_ed25519_cert_internal(keypair, spiffe_id_fn)
+}
+
+/// Internal certificate generation with optional SPIFFE ID generator.
+fn generate_ed25519_cert_internal<F>(
+    keypair: &Keypair,
+    spiffe_id_fn: Option<F>,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>
+where
+    F: FnOnce(&crate::identity::Identity) -> String,
+{
     let secret_key = keypair.secret_key_bytes();
     let public_key = keypair.public_key_bytes();
+    let identity = keypair.identity();
     
     const ED25519_OID: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
     const PKCS8_VERSION: [u8; 3] = [0x02, 0x01, 0x00];
@@ -177,12 +313,35 @@ pub fn generate_ed25519_cert(
     let key_pair = rcgen::KeyPair::try_from(&pkcs8_der)
         .context("failed to create Ed25519 key pair for certificate")?;
     
-    let mut params = rcgen::CertificateParams::new(vec!["korium".to_string()])
-        .context("failed to create certificate params")?;
+    // Build Subject Alternative Names
+    let identity_hex = hex::encode(public_key);
+    let mut subject_alt_names: Vec<rcgen::SanType> = vec![
+        // DNS SAN for SNI compatibility (identity encoded as two 32-char labels)
+        rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from(format!(
+                "{}.{}",
+                &identity_hex[..32],
+                &identity_hex[32..]
+            ))
+            .context("failed to create DNS SAN")?,
+        ),
+    ];
+    
+    // Add SPIFFE URI SAN if configured
+    if let Some(make_spiffe_id) = spiffe_id_fn {
+        let spiffe_id = make_spiffe_id(&identity);
+        subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::Ia5String::try_from(spiffe_id)
+                .context("failed to create SPIFFE URI SAN")?,
+        ));
+    }
+    
+    let mut params = rcgen::CertificateParams::default();
+    params.subject_alt_names = subject_alt_names;
     
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String(hex::encode(public_key)),
+        rcgen::DnValue::Utf8String(identity_hex),
     );
     
     let cert = params
@@ -272,6 +431,105 @@ pub fn extract_verified_identity(connection: &quinn::Connection) -> Option<Ident
     let cert_der = certs.first()?.as_ref();
     let public_key = extract_public_key_from_cert(cert_der)?;
     Some(Identity::from_bytes(public_key))
+}
+
+/// Extract SPIFFE ID from a peer's X.509 certificate.
+///
+/// Parses the certificate's Subject Alternative Names and returns the first
+/// URI SAN that starts with `spiffe://`.
+///
+/// This is useful for integrating Korium nodes with SPIFFE-aware systems
+/// that need to extract the workload identity from the TLS certificate.
+///
+/// # Returns
+/// - `Some(String)` - The SPIFFE ID (e.g., `spiffe://example.org/{identity_hex}`)
+/// - `None` - If no SPIFFE URI SAN is present or certificate parsing fails
+///
+/// # Example
+/// ```ignore
+/// let spiffe_id = extract_spiffe_id_from_connection(&connection);
+/// if let Some(id) = spiffe_id {
+///     println!("Peer SPIFFE ID: {}", id);  // spiffe://example.org/abc123...
+/// }
+/// ```
+#[cfg(feature = "spiffe")]
+pub fn extract_spiffe_id_from_connection(connection: &quinn::Connection) -> Option<String> {
+    let peer_identity = connection.peer_identity()?;
+    let certs: &Vec<rustls::pki_types::CertificateDer> = peer_identity.downcast_ref()?;
+    let cert_der = certs.first()?.as_ref();
+    extract_spiffe_id_from_cert(cert_der)
+}
+
+/// Extract SPIFFE ID from a DER-encoded X.509 certificate.
+///
+/// Parses the certificate's Subject Alternative Names and returns the first
+/// URI SAN that starts with `spiffe://`.
+#[cfg(feature = "spiffe")]
+pub fn extract_spiffe_id_from_cert(cert_der: &[u8]) -> Option<String> {
+    use x509_parser::prelude::*;
+    use x509_parser::extensions::GeneralName;
+    
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    
+    // Find the Subject Alternative Name extension
+    for ext in cert.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+            for name in &san.general_names {
+                if let GeneralName::URI(uri) = name {
+                    if uri.starts_with("spiffe://") {
+                        return Some(uri.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+/// Validate that a SPIFFE ID matches the expected format and trust domain.
+///
+/// Checks that:
+/// 1. The SPIFFE ID starts with `spiffe://`
+/// 2. The trust domain matches the expected value
+/// 3. The path contains a valid hex-encoded identity (64 chars)
+///
+/// # Arguments
+/// * `spiffe_id` - The SPIFFE ID to validate
+/// * `expected_trust_domain` - The expected trust domain (e.g., "example.org")
+///
+/// # Returns
+/// - `Some(Identity)` - The extracted Korium Identity if validation succeeds
+/// - `None` - If validation fails
+#[cfg(feature = "spiffe")]
+pub fn validate_spiffe_id(spiffe_id: &str, expected_trust_domain: &str) -> Option<Identity> {
+    // Parse: spiffe://{trust_domain}/{identity_hex}[/{workload_path}]
+    let stripped = spiffe_id.strip_prefix("spiffe://")?;
+    
+    // Split into trust_domain and path
+    let slash_pos = stripped.find('/')?;
+    let (trust_domain, path) = stripped.split_at(slash_pos);
+    let path = &path[1..]; // Remove leading /
+    
+    // Verify trust domain
+    if trust_domain != expected_trust_domain {
+        return None;
+    }
+    
+    // Extract identity hex (first 64 chars of path, or until next /)
+    let identity_hex = if let Some(next_slash) = path.find('/') {
+        &path[..next_slash]
+    } else {
+        path
+    };
+    
+    // Validate hex length (64 chars = 32 bytes)
+    if identity_hex.len() != 64 {
+        return None;
+    }
+    
+    // Parse and return identity
+    Identity::from_hex(identity_hex).ok()
 }
 
 #[derive(Debug)]
@@ -532,6 +790,163 @@ mod tests {
                 public_keys.insert(cert_pk),
                 "P4 violation: Certificate public key collision between different keypairs"
             );
+        }
+    }
+
+    // ========================================================================
+    // SPIFFE Compatibility Tests
+    // ========================================================================
+
+    #[cfg(feature = "spiffe")]
+    mod spiffe_tests {
+        use super::*;
+
+        #[test]
+        fn spiffe_config_generates_correct_id() {
+            let keypair = Keypair::generate();
+            let identity = keypair.identity();
+            let identity_hex = hex::encode(identity.as_bytes());
+            
+            // Without workload path
+            let config = SpiffeConfig::new("example.org");
+            let spiffe_id = config.spiffe_id(&identity);
+            assert_eq!(
+                spiffe_id,
+                format!("spiffe://example.org/{}", identity_hex),
+                "SPIFFE ID format without workload path"
+            );
+            
+            // With workload path
+            let config = SpiffeConfig::new("example.org")
+                .with_workload_path("payment-svc");
+            let spiffe_id = config.spiffe_id(&identity);
+            assert_eq!(
+                spiffe_id,
+                format!("spiffe://example.org/{}/payment-svc", identity_hex),
+                "SPIFFE ID format with workload path"
+            );
+        }
+
+        #[test]
+        fn cert_with_spiffe_contains_uri_san() {
+            let keypair = Keypair::generate();
+            let identity = keypair.identity();
+            let identity_hex = hex::encode(identity.as_bytes());
+            
+            let config = SpiffeConfig::new("test.domain")
+                .with_workload_path("worker");
+            
+            let (certs, _) = generate_ed25519_cert_with_spiffe(&keypair, Some(&config))
+                .expect("cert generation must succeed");
+            
+            let cert_der = certs[0].as_ref();
+            
+            // Verify public key is still correctly embedded
+            let extracted_pk = extract_public_key_from_cert(cert_der)
+                .expect("public key extraction must succeed");
+            assert_eq!(
+                extracted_pk,
+                *identity.as_bytes(),
+                "Public key must match identity"
+            );
+            
+            // Verify SPIFFE ID is extractable
+            let spiffe_id = extract_spiffe_id_from_cert(cert_der)
+                .expect("SPIFFE ID extraction must succeed");
+            assert_eq!(
+                spiffe_id,
+                format!("spiffe://test.domain/{}/worker", identity_hex),
+                "SPIFFE ID must match expected format"
+            );
+        }
+
+        #[test]
+        fn cert_without_spiffe_has_no_uri_san() {
+            let keypair = Keypair::generate();
+            
+            let (certs, _) = generate_ed25519_cert_with_spiffe(&keypair, None)
+                .expect("cert generation must succeed");
+            
+            let cert_der = certs[0].as_ref();
+            
+            // Should return None when no SPIFFE SAN present
+            let spiffe_id = extract_spiffe_id_from_cert(cert_der);
+            assert!(
+                spiffe_id.is_none(),
+                "Certificate without SPIFFE config should not have URI SAN"
+            );
+        }
+
+        #[test]
+        fn validate_spiffe_id_parses_correctly() {
+            let keypair = Keypair::generate();
+            let identity = keypair.identity();
+            let identity_hex = hex::encode(identity.as_bytes());
+            
+            // Valid SPIFFE ID without workload path
+            let spiffe_id = format!("spiffe://example.org/{}", identity_hex);
+            let extracted = validate_spiffe_id(&spiffe_id, "example.org")
+                .expect("valid SPIFFE ID should parse");
+            assert_eq!(extracted, identity, "Extracted identity must match");
+            
+            // Valid SPIFFE ID with workload path
+            let spiffe_id = format!("spiffe://example.org/{}/worker", identity_hex);
+            let extracted = validate_spiffe_id(&spiffe_id, "example.org")
+                .expect("valid SPIFFE ID with path should parse");
+            assert_eq!(extracted, identity, "Extracted identity must match");
+            
+            // Wrong trust domain
+            let spiffe_id = format!("spiffe://wrong.domain/{}", identity_hex);
+            assert!(
+                validate_spiffe_id(&spiffe_id, "example.org").is_none(),
+                "Wrong trust domain should fail validation"
+            );
+            
+            // Invalid identity hex (too short)
+            let spiffe_id = "spiffe://example.org/abc123";
+            assert!(
+                validate_spiffe_id(spiffe_id, "example.org").is_none(),
+                "Invalid identity hex should fail validation"
+            );
+            
+            // Not a SPIFFE URI
+            let spiffe_id = "https://example.org/something";
+            assert!(
+                validate_spiffe_id(spiffe_id, "example.org").is_none(),
+                "Non-SPIFFE URI should fail validation"
+            );
+        }
+
+        #[test]
+        fn spiffe_id_cryptographically_bound_to_identity() {
+            // Verify that the SPIFFE ID is deterministically derived from identity
+            for _ in 0..20 {
+                let keypair = Keypair::generate();
+                let identity = keypair.identity();
+                let identity_hex = hex::encode(identity.as_bytes());
+                
+                let config = SpiffeConfig::new("mesh.korium");
+                
+                let (certs, _) = generate_ed25519_cert_with_spiffe(&keypair, Some(&config))
+                    .expect("cert generation must succeed");
+                
+                let spiffe_id = extract_spiffe_id_from_cert(certs[0].as_ref())
+                    .expect("SPIFFE ID extraction must succeed");
+                
+                // Verify the identity hex is embedded in the SPIFFE ID
+                assert!(
+                    spiffe_id.contains(&identity_hex),
+                    "SPIFFE ID must contain the identity hex"
+                );
+                
+                // Verify we can extract the identity back
+                let extracted = validate_spiffe_id(&spiffe_id, "mesh.korium")
+                    .expect("SPIFFE ID should be valid");
+                assert_eq!(
+                    extracted, identity,
+                    "Extracted identity must match original"
+                );
+            }
         }
     }
 

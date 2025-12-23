@@ -348,7 +348,7 @@ impl std::fmt::Debug for Keypair {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Identity([u8; 32]);
 
 impl Identity {
