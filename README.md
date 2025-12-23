@@ -591,7 +591,7 @@ The threshold CA is included when the `spiffe` feature is enabled.
 ### Running DKG (Key Generation Ceremony)
 
 ```rust
-use korium::thresholdca::{ThresholdCaConfig, DkgCoordinator, SignerState};
+use korium::{ThresholdCaConfig, DkgCoordinator, SignerState};
 
 // Configure 5 signers, require 3 to sign (Byzantine fault tolerant)
 let config = ThresholdCaConfig::new(5, 3, "make.run")?;
@@ -623,7 +623,7 @@ let serialized = signer_state.serialize()?;
 ### Signing Certificates
 
 ```rust
-use korium::thresholdca::{
+use korium::{
     SigningRequest, generate_signing_commitment, sign_with_share, aggregate_signatures
 };
 
@@ -650,8 +650,7 @@ let signature = aggregate_signatures(
 For automatic signing, configure nodes as signers using `NodeBuilder`:
 
 ```rust
-use korium::{Node, CaRequestConfig};
-use korium::thresholdca::SignerState;
+use korium::{Node, CaRequestConfig, SignerState};
 
 // === Signer Node ===
 // Load signer state from encrypted storage (from DKG ceremony)
