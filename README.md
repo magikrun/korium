@@ -444,6 +444,10 @@ let msg = rx.recv().await?;  // msg.from is verified sender
 
 Korium supports [SPIFFE](https://spiffe.io/) (Secure Production Identity Framework for Everyone) as an **optional interoperability layer**. This enables Korium nodes to present SPIFFE-compliant X.509 certificates for integration with enterprise service meshes and identity-aware proxies.
 
+The `spiffe` feature includes:
+- **SPIFFE ID generation** — X.509 URI SAN extensions with trust domain/workload identifiers
+- **Threshold CA** — Distributed K-of-N certificate signing using FROST signatures
+
 ### Architecture
 
 **Important:** SPIFFE compatibility is additive—it does NOT replace Korium's native Ed25519 self-certifying identity model. The SPIFFE ID is embedded as a URI SAN (Subject Alternative Name) in X.509 certificates and is cryptographically bound to the node's identity.
@@ -462,7 +466,7 @@ Add the feature flag to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-korium = { version = "0.1", features = ["spiffe"] }
+korium = { version = "0.2", features = ["spiffe"] }
 ```
 
 ### Creating a Node with SPIFFE
@@ -559,9 +563,9 @@ if let Some(spiffe_id) = extract_spiffe_id_from_cert(&peer_cert)? {
 - **Zero Runtime Cost:** When the `spiffe-compat` feature is disabled, no SPIFFE code is compiled
 - **No Revocation Infrastructure:** Without a CA, certificate revocation relies on DHT record expiry and GossipSub peer scoring—nodes with bad behavior are deprioritized, not revoked
 
-## Threshold CA (Optional)
+## Threshold CA
 
-For enterprise integrations requiring CA-backed certificates, Korium provides a **distributed threshold CA** using FROST (Flexible Round-Optimized Schnorr Threshold) signatures. This enables K-of-N signing without any single party holding the complete CA private key.
+For enterprise integrations requiring CA-backed certificates, the `spiffe` feature includes a **distributed threshold CA** using FROST (Flexible Round-Optimized Schnorr Threshold) signatures. This enables K-of-N signing without any single party holding the complete CA private key.
 
 ### How It Works
 
@@ -585,8 +589,6 @@ For enterprise integrations requiring CA-backed certificates, Korium provides a 
 │     - Any K honest signers can produce valid signatures             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
-
-The threshold CA is included when the `spiffe` feature is enabled.
 
 ### Running DKG (Key Generation Ceremony)
 
