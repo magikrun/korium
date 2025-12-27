@@ -59,13 +59,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
 
-use quinn::{AsyncUdpSocket, UdpPoller};
 use quinn::udp::{RecvMeta, Transmit};
+use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::identity::{Contact, Identity};
-use crate::relay::{Relay, RelayTunnel, RELAY_MAGIC, MAX_RELAY_FRAME_SIZE};
+use crate::relay::{MAX_RELAY_FRAME_SIZE, RELAY_MAGIC, Relay, RelayTunnel};
 
 /// Callback trait for path change notifications.
 /// Implementors receive notifications when SmartSock detects better paths to peers.
@@ -73,11 +73,10 @@ use crate::relay::{Relay, RelayTunnel, RELAY_MAGIC, MAX_RELAY_FRAME_SIZE};
 pub trait PathEventHandler: Send + Sync {
     /// Called when a better path to a peer is discovered and activated.
     async fn on_path_improved(&self, peer: Identity, new_path: PathChoice);
-    
+
     /// Called when a peer becomes unreachable (all paths failed).
     async fn on_peer_unreachable(&self, peer: Identity);
 }
-
 
 // ============================================================================
 // SmartSock Transport Constants
@@ -168,9 +167,12 @@ impl PathProbeRequest {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        Self { tx_id, timestamp_ms }
+        Self {
+            tx_id,
+            timestamp_ms,
+        }
     }
-    
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(PROBE_HEADER_SIZE);
         buf.extend_from_slice(&PROBE_MAGIC);
@@ -179,7 +181,7 @@ impl PathProbeRequest {
         buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
         buf
     }
-    
+
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < PROBE_HEADER_SIZE {
             return None;
@@ -192,7 +194,7 @@ impl PathProbeRequest {
             timestamp_ms: u64::from_le_bytes(data[13..21].try_into().ok()?),
         })
     }
-    
+
     pub fn is_probe_request(data: &[u8]) -> bool {
         data.len() >= 5 && data[0..4] == PROBE_MAGIC && data[4] == PROBE_TYPE_REQUEST
     }
@@ -213,14 +215,14 @@ impl PathProbeResponse {
             observed_addr,
         }
     }
-    
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32);
         buf.extend_from_slice(&PROBE_MAGIC);
         buf.push(PROBE_TYPE_RESPONSE);
         buf.extend_from_slice(&self.tx_id.to_le_bytes());
         buf.extend_from_slice(&self.echo_timestamp_ms.to_le_bytes());
-        
+
         match self.observed_addr {
             SocketAddr::V4(addr) => {
                 buf.push(4);
@@ -235,7 +237,7 @@ impl PathProbeResponse {
         }
         buf
     }
-    
+
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < PROBE_HEADER_SIZE + 1 {
             return None;
@@ -243,10 +245,10 @@ impl PathProbeResponse {
         if data[0..4] != PROBE_MAGIC || data[4] != PROBE_TYPE_RESPONSE {
             return None;
         }
-        
+
         let tx_id = u64::from_le_bytes(data[5..13].try_into().ok()?);
         let echo_timestamp_ms = u64::from_le_bytes(data[13..21].try_into().ok()?);
-        
+
         let addr_type = data[21];
         let observed_addr = match addr_type {
             4 if data.len() >= 28 => {
@@ -263,14 +265,18 @@ impl PathProbeResponse {
             }
             _ => return None,
         };
-        
-        Some(Self { tx_id, echo_timestamp_ms, observed_addr })
+
+        Some(Self {
+            tx_id,
+            echo_timestamp_ms,
+            observed_addr,
+        })
     }
-    
+
     pub fn is_probe_response(data: &[u8]) -> bool {
         data.len() >= 5 && data[0..4] == PROBE_MAGIC && data[4] == PROBE_TYPE_RESPONSE
     }
-    
+
     /// Maximum RTT value to prevent f32 precision loss.
     /// 60 seconds is far beyond any reasonable network RTT.
     const MAX_RTT_MS: u64 = 60_000;
@@ -281,7 +287,9 @@ impl PathProbeResponse {
             .unwrap_or_default()
             .as_millis() as u64;
         // Clamp to MAX_RTT_MS to prevent f32 precision loss for extreme values
-        let rtt = now_ms.saturating_sub(self.echo_timestamp_ms).min(Self::MAX_RTT_MS);
+        let rtt = now_ms
+            .saturating_sub(self.echo_timestamp_ms)
+            .min(Self::MAX_RTT_MS);
         rtt as f32
     }
 }
@@ -321,7 +329,7 @@ impl PathCandidateInfo {
             probe_seq: 0,
         }
     }
-    
+
     pub fn new_relay(relay_addr: SocketAddr, session_id: [u8; 16]) -> Self {
         Self {
             addr: relay_addr,
@@ -335,26 +343,26 @@ impl PathCandidateInfo {
             probe_seq: 0,
         }
     }
-    
+
     pub fn needs_probe(&self) -> bool {
         match self.state {
             PathCandidateState::Failed => false,
             PathCandidateState::Unknown => true,
-            PathCandidateState::Probing | PathCandidateState::Active => {
-                self.last_probe
-                    .map(|t| t.elapsed() >= PATH_PROBE_INTERVAL)
-                    .unwrap_or(true)
-            }
+            PathCandidateState::Probing | PathCandidateState::Active => self
+                .last_probe
+                .is_none_or(|t| t.elapsed() >= PATH_PROBE_INTERVAL),
         }
     }
-    
+
     pub fn is_usable(&self) -> bool {
-        matches!(self.state, PathCandidateState::Active | PathCandidateState::Probing)
-            && self.last_success
-                .map(|t| t.elapsed() < PATH_STALE_TIMEOUT)
-                .unwrap_or(false)
+        matches!(
+            self.state,
+            PathCandidateState::Active | PathCandidateState::Probing
+        ) && self
+            .last_success
+            .is_some_and(|t| t.elapsed() < PATH_STALE_TIMEOUT)
     }
-    
+
     pub fn record_success(&mut self, rtt: Duration) {
         let rtt_sample = rtt.as_secs_f32() * 1000.0;
         self.rtt_ms = Some(match self.rtt_ms {
@@ -365,14 +373,14 @@ impl PathCandidateInfo {
         self.last_success = Some(Instant::now());
         self.failures = 0;
     }
-    
+
     pub fn record_failure(&mut self) {
         self.failures = self.failures.saturating_add(1);
         if self.failures >= MAX_PROBE_FAILURES {
             self.state = PathCandidateState::Failed;
         }
     }
-    
+
     pub fn mark_probed(&mut self) {
         self.last_probe = Some(Instant::now());
         self.probe_seq = self.probe_seq.wrapping_add(1);
@@ -387,21 +395,21 @@ pub struct SmartAddr(SocketAddr);
 
 impl SmartAddr {
     const PREFIX: [u8; 6] = [0xfd, 0x00, 0xc0, 0xf1, 0x00, 0x00];
-    
+
     const DEFAULT_PORT: u16 = 1;
 
     pub fn from_identity(identity: &Identity) -> Self {
         let hash = blake3::hash(identity.as_bytes());
         let hash_bytes = hash.as_bytes();
-        
+
         let mut octets = [0u8; 16];
         octets[..6].copy_from_slice(&Self::PREFIX);
         octets[6..16].copy_from_slice(&hash_bytes[..10]);
-        
+
         let ipv6 = Ipv6Addr::from(octets);
         Self(SocketAddr::new(IpAddr::V6(ipv6), Self::DEFAULT_PORT))
     }
-    
+
     pub fn is_smart_addr(addr: &SocketAddr) -> bool {
         match addr.ip() {
             IpAddr::V6(v6) => {
@@ -411,7 +419,7 @@ impl SmartAddr {
             IpAddr::V4(_) => false,
         }
     }
-    
+
     pub fn socket_addr(&self) -> SocketAddr {
         self.0
     }
@@ -431,9 +439,12 @@ impl From<SmartAddr> for SocketAddr {
 
 #[derive(Debug, Clone)]
 pub enum PathChoice {
-    Direct { addr: SocketAddr, rtt_ms: f32 },
-    Relay { 
-        relay_addr: SocketAddr, 
+    Direct {
+        addr: SocketAddr,
+        rtt_ms: f32,
+    },
+    Relay {
+        relay_addr: SocketAddr,
         session_id: [u8; 16],
         rtt_ms: f32,
     },
@@ -456,8 +467,9 @@ pub struct PeerPathState {
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
         let identity_hash = blake3::hash(identity.as_bytes());
-        let identity_probe_prefix = u64::from_le_bytes(identity_hash.as_bytes()[0..8].try_into().unwrap());
-        
+        let identity_probe_prefix =
+            u64::from_le_bytes(identity_hash.as_bytes()[0..8].try_into().unwrap());
+
         // Use CSPRNG for probe counter initialization, with deterministic fallback
         // if system RNG is unavailable (early boot, containers, etc.)
         let next_probe_counter = {
@@ -479,7 +491,7 @@ impl PeerPathState {
                 u64::from_le_bytes(fallback_hash.as_bytes()[8..16].try_into().unwrap())
             }
         };
-        
+
         Self {
             identity,
             direct_addrs: Vec::new(),
@@ -492,30 +504,29 @@ impl PeerPathState {
             identity_probe_prefix,
         }
     }
-    
+
     fn next_probe_id(&mut self) -> u64 {
         let counter = self.next_probe_counter;
         self.next_probe_counter = self.next_probe_counter.wrapping_add(1);
         self.identity_probe_prefix ^ counter
     }
-    
+
     pub fn best_addr(&self) -> Option<SocketAddr> {
         match &self.active_path {
             Some(PathChoice::Direct { addr, .. }) => Some(*addr),
             Some(PathChoice::Relay { relay_addr, .. }) => Some(*relay_addr),
-            None => {
-                self.direct_addrs.first().copied()
-                    .or_else(|| self.relay_tunnels.values().next().map(|t| t.relay_addr))
-            }
+            None => self
+                .direct_addrs
+                .first()
+                .copied()
+                .or_else(|| self.relay_tunnels.values().next().map(|t| t.relay_addr)),
         }
     }
 
     /// Returns the currently active relay tunnel, if the active path uses a relay.
     pub fn active_tunnel(&self) -> Option<&RelayTunnel> {
         match &self.active_path {
-            Some(PathChoice::Relay { session_id, .. }) => {
-                self.relay_tunnels.get(session_id)
-            }
+            Some(PathChoice::Relay { session_id, .. }) => self.relay_tunnels.get(session_id),
             _ => None,
         }
     }
@@ -524,12 +535,15 @@ impl PeerPathState {
     pub fn is_relayed(&self) -> bool {
         matches!(self.active_path, Some(PathChoice::Relay { .. }))
     }
-    
+
     pub fn add_direct_candidate(&mut self, addr: SocketAddr) {
-        if self.candidates.len() >= MAX_CANDIDATES_PER_PEER && !self.candidates.contains_key(&addr) {
+        if self.candidates.len() >= MAX_CANDIDATES_PER_PEER && !self.candidates.contains_key(&addr)
+        {
             return;
         }
-        self.candidates.entry(addr).or_insert_with(|| PathCandidateInfo::new_direct(addr));
+        self.candidates
+            .entry(addr)
+            .or_insert_with(|| PathCandidateInfo::new_direct(addr));
         if !self.direct_addrs.contains(&addr) {
             if self.direct_addrs.len() >= MAX_DIRECT_ADDRS_PER_PEER {
                 return;
@@ -537,14 +551,18 @@ impl PeerPathState {
             self.direct_addrs.push(addr);
         }
     }
-    
+
     pub fn add_relay_candidate(&mut self, relay_addr: SocketAddr, session_id: [u8; 16]) {
-        if self.candidates.len() >= MAX_CANDIDATES_PER_PEER && !self.candidates.contains_key(&relay_addr) {
+        if self.candidates.len() >= MAX_CANDIDATES_PER_PEER
+            && !self.candidates.contains_key(&relay_addr)
+        {
             return;
         }
-        self.candidates.entry(relay_addr).or_insert_with(|| PathCandidateInfo::new_relay(relay_addr, session_id));
+        self.candidates
+            .entry(relay_addr)
+            .or_insert_with(|| PathCandidateInfo::new_relay(relay_addr, session_id));
     }
-    
+
     pub fn candidates_needing_probe(&self) -> Vec<SocketAddr> {
         self.candidates
             .iter()
@@ -552,14 +570,15 @@ impl PeerPathState {
             .map(|(addr, _)| *addr)
             .collect()
     }
-    
+
     pub fn generate_probe(&mut self, addr: SocketAddr) -> Option<(u64, PathProbeRequest)> {
         if !self.candidates.contains_key(&addr) {
             return None;
         }
-        
+
         if self.pending_probes.len() >= MAX_PENDING_PROBES_PER_PEER {
-            let oldest_tx_id = self.pending_probes
+            let oldest_tx_id = self
+                .pending_probes
                 .iter()
                 .min_by_key(|(_, (_, sent_at))| *sent_at)
                 .map(|(tx_id, _)| *tx_id);
@@ -567,30 +586,30 @@ impl PeerPathState {
                 self.pending_probes.remove(&old_id);
             }
         }
-        
+
         let tx_id = self.next_probe_id();
-        
+
         let candidate = self.candidates.get_mut(&addr)?;
         candidate.mark_probed();
         self.pending_probes.insert(tx_id, (addr, Instant::now()));
-        
+
         Some((tx_id, PathProbeRequest::new(tx_id)))
     }
-    
+
     pub fn handle_probe_response(&mut self, tx_id: u64, rtt: Duration) -> bool {
         let (addr, _sent_at) = match self.pending_probes.remove(&tx_id) {
             Some(info) => info,
             None => return false,
         };
-        
+
         let candidate = match self.candidates.get_mut(&addr) {
             Some(c) => c,
             None => return false,
         };
-        
+
         let was_failed = candidate.state == PathCandidateState::Failed;
         candidate.record_success(rtt);
-        
+
         tracing::debug!(
             peer = ?self.identity,
             addr = %addr,
@@ -598,18 +617,19 @@ impl PeerPathState {
             is_relay = candidate.is_relay,
             "probe response received"
         );
-        
+
         was_failed || candidate.state == PathCandidateState::Active
     }
-    
+
     pub fn expire_probes(&mut self, timeout: Duration) {
         let now = Instant::now();
-        let expired: Vec<_> = self.pending_probes
+        let expired: Vec<_> = self
+            .pending_probes
             .iter()
             .filter(|(_, (_, sent))| now.duration_since(*sent) > timeout)
             .map(|(tx_id, (addr, _))| (*tx_id, *addr))
             .collect();
-        
+
         for (tx_id, addr) in expired {
             self.pending_probes.remove(&tx_id);
             if let Some(candidate) = self.candidates.get_mut(&addr) {
@@ -617,34 +637,41 @@ impl PeerPathState {
             }
         }
     }
-    
+
     pub fn select_best_path(&self) -> Option<PathChoice> {
-        let usable: Vec<_> = self.candidates
+        let usable: Vec<_> = self
+            .candidates
             .iter()
             .filter(|(_, c)| c.is_usable())
             .collect();
-        
+
         if usable.is_empty() {
             return None;
         }
-        
-        let best_direct = usable.iter()
+
+        let best_direct = usable
+            .iter()
             .filter(|(_, c)| !c.is_relay)
             .min_by(|(_, a), (_, b)| {
-                a.rtt_ms.partial_cmp(&b.rtt_ms).unwrap_or(std::cmp::Ordering::Equal)
+                a.rtt_ms
+                    .partial_cmp(&b.rtt_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
-        
-        let best_relay = usable.iter()
+
+        let best_relay = usable
+            .iter()
             .filter(|(_, c)| c.is_relay)
             .min_by(|(_, a), (_, b)| {
-                a.rtt_ms.partial_cmp(&b.rtt_ms).unwrap_or(std::cmp::Ordering::Equal)
+                a.rtt_ms
+                    .partial_cmp(&b.rtt_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
-        
+
         match (best_direct, best_relay) {
             (Some((_, direct)), Some((_, relay))) => {
                 let direct_rtt = direct.rtt_ms.unwrap_or(f32::MAX);
                 let relay_rtt = relay.rtt_ms.unwrap_or(f32::MAX);
-                
+
                 if relay_rtt + RELAY_RTT_ADVANTAGE_MS < direct_rtt {
                     Some(PathChoice::Relay {
                         relay_addr: relay.addr,
@@ -658,45 +685,54 @@ impl PeerPathState {
                     })
                 }
             }
-            (Some((_, direct)), None) => {
-                Some(PathChoice::Direct {
-                    addr: direct.addr,
-                    rtt_ms: direct.rtt_ms.unwrap_or(f32::MAX),
-                })
-            }
-            (None, Some((_, relay))) => {
-                Some(PathChoice::Relay {
-                    relay_addr: relay.addr,
-                    session_id: relay.session_id.unwrap_or([0; 16]),
-                    rtt_ms: relay.rtt_ms.unwrap_or(f32::MAX),
-                })
-            }
+            (Some((_, direct)), None) => Some(PathChoice::Direct {
+                addr: direct.addr,
+                rtt_ms: direct.rtt_ms.unwrap_or(f32::MAX),
+            }),
+            (None, Some((_, relay))) => Some(PathChoice::Relay {
+                relay_addr: relay.addr,
+                session_id: relay.session_id.unwrap_or([0; 16]),
+                rtt_ms: relay.rtt_ms.unwrap_or(f32::MAX),
+            }),
             (None, None) => None,
         }
     }
-    
+
     pub fn maybe_switch_path(&mut self) -> Option<PathChoice> {
         let best = self.select_best_path()?;
         let was_relayed = self.is_relayed();
         // Capture tunnel age before switching (for diagnostics when leaving relay path)
         let tunnel_age_secs = self.active_tunnel().map(|t| t.age().as_secs());
-        
+
         let should_switch = match (&self.active_path, &best) {
             (None, _) => true,
-            (Some(PathChoice::Relay { .. }), PathChoice::Direct { .. }) => {
-                true
-            }
-            (Some(PathChoice::Direct { rtt_ms: old_rtt, .. }), PathChoice::Direct { rtt_ms: new_rtt, .. }) => {
-                *new_rtt + 10.0 < *old_rtt
-            }
-            (Some(PathChoice::Direct { rtt_ms: direct_rtt, .. }), PathChoice::Relay { rtt_ms: relay_rtt, .. }) => {
-                *relay_rtt + RELAY_RTT_ADVANTAGE_MS < *direct_rtt
-            }
-            (Some(PathChoice::Relay { rtt_ms: old_rtt, .. }), PathChoice::Relay { rtt_ms: new_rtt, .. }) => {
-                *new_rtt + 20.0 < *old_rtt
-            }
+            (Some(PathChoice::Relay { .. }), PathChoice::Direct { .. }) => true,
+            (
+                Some(PathChoice::Direct {
+                    rtt_ms: old_rtt, ..
+                }),
+                PathChoice::Direct {
+                    rtt_ms: new_rtt, ..
+                },
+            ) => *new_rtt + 10.0 < *old_rtt,
+            (
+                Some(PathChoice::Direct {
+                    rtt_ms: direct_rtt, ..
+                }),
+                PathChoice::Relay {
+                    rtt_ms: relay_rtt, ..
+                },
+            ) => *relay_rtt + RELAY_RTT_ADVANTAGE_MS < *direct_rtt,
+            (
+                Some(PathChoice::Relay {
+                    rtt_ms: old_rtt, ..
+                }),
+                PathChoice::Relay {
+                    rtt_ms: new_rtt, ..
+                },
+            ) => *new_rtt + 20.0 < *old_rtt,
         };
-        
+
         if should_switch {
             tracing::info!(
                 peer = ?self.identity,
@@ -716,19 +752,19 @@ impl PeerPathState {
 
 pub struct SmartSock {
     inner: Arc<tokio::net::UdpSocket>,
-    
+
     /// Peer tracking map, bounded by MAX_SMARTSOCK_PEERS with LRU eviction.
     peers: RwLock<HashMap<SmartAddr, PeerPathState>>,
-    
+
     /// Reverse lookup: SocketAddr → SmartAddr.
     /// SECURITY: Bounded by MAX_REVERSE_MAP_ENTRIES with LRU eviction to prevent
     /// memory exhaustion from address proliferation attacks.
     reverse_map: RwLock<LruCache<SocketAddr, SmartAddr>>,
-    
+
     local_addr: SocketAddr,
 
     udprelay: StdRwLock<Option<Relay>>,
-    
+
     /// Optional handler for path change events (uses tokio RwLock for async safety)
     path_event_handler: RwLock<Option<Arc<dyn PathEventHandler>>>,
 }
@@ -737,10 +773,10 @@ impl SmartSock {
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
         let socket = tokio::net::UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
-        
+
         let reverse_map_cap = NonZeroUsize::new(MAX_REVERSE_MAP_ENTRIES)
             .expect("MAX_REVERSE_MAP_ENTRIES must be non-zero");
-        
+
         Ok(Self {
             inner: Arc::new(socket),
             peers: RwLock::new(HashMap::new()),
@@ -766,24 +802,24 @@ impl SmartSock {
     pub fn local_address(&self) -> SocketAddr {
         self.local_addr
     }
-    
+
     /// Set the path event handler to receive notifications when paths change.
     pub async fn set_path_event_handler(&self, handler: Arc<dyn PathEventHandler>) {
         let mut guard = self.path_event_handler.write().await;
         *guard = Some(handler);
     }
-    
+
     /// Get the current path event handler, if set.
     async fn get_path_event_handler(&self) -> Option<Arc<dyn PathEventHandler>> {
         self.path_event_handler.read().await.clone()
     }
-    
+
     /// Cache a contact by parsing its addresses and registering as a peer.
     /// This is a convenience method that handles address parsing.
     pub async fn cache_contact(&self, contact: &Contact) {
         // Parse all addresses from the contact
         let mut addrs: Vec<SocketAddr> = Vec::new();
-        
+
         // Parse all addresses
         for addr_str in &contact.addrs {
             if let Ok(addr) = addr_str.parse::<SocketAddr>()
@@ -792,7 +828,7 @@ impl SmartSock {
                 addrs.push(addr);
             }
         }
-        
+
         // Only register if we have at least one valid address
         if !addrs.is_empty() {
             self.register_peer(contact.identity, addrs).await;
@@ -805,21 +841,24 @@ impl SmartSock {
         direct_addrs: Vec<SocketAddr>,
     ) -> SmartAddr {
         let smart_addr = SmartAddr::from_identity(&identity);
-        
+
         let mut state = PeerPathState::new(identity);
         state.direct_addrs = direct_addrs.clone();
-        
+
         if let Some(addr) = direct_addrs.first() {
-            state.active_path = Some(PathChoice::Direct { 
-                addr: *addr, 
-                rtt_ms: f32::MAX,            });
+            state.active_path = Some(PathChoice::Direct {
+                addr: *addr,
+                rtt_ms: f32::MAX,
+            });
         }
-        
+
         {
             let mut peers = self.peers.write().await;
-            
-            if peers.len() >= MAX_SMARTSOCK_PEERS && !peers.contains_key(&smart_addr)
-                && let Some(oldest_addr) = peers.iter()
+
+            if peers.len() >= MAX_SMARTSOCK_PEERS
+                && !peers.contains_key(&smart_addr)
+                && let Some(oldest_addr) = peers
+                    .iter()
                     .min_by_key(|(_, s)| s.last_recv)
                     .map(|(k, _)| *k)
                 && let Some(evicted) = peers.remove(&oldest_addr)
@@ -842,20 +881,20 @@ impl SmartSock {
                     "evicted oldest peer from SmartSock to make room"
                 );
             }
-            
+
             peers.insert(smart_addr, state);
         }
-        
+
         {
             let mut reverse = self.reverse_map.write().await;
             for addr in direct_addrs {
                 reverse.put(addr, smart_addr);
             }
         }
-        
+
         smart_addr
     }
-    
+
     pub async fn add_relay_tunnel(
         &self,
         identity: &Identity,
@@ -863,15 +902,15 @@ impl SmartSock {
         relay_addr: SocketAddr,
     ) -> Option<SmartAddr> {
         let smart_addr = SmartAddr::from_identity(identity);
-        
+
         let tunnel = RelayTunnel::new(session_id, relay_addr, *identity);
-        
+
         let mut peers = self.peers.write().await;
         let state = peers.get_mut(&smart_addr)?;
-        
+
         // SECURITY: Enforce per-peer relay tunnel limit to prevent memory exhaustion
-        if state.relay_tunnels.len() >= MAX_RELAY_TUNNELS_PER_PEER 
-            && !state.relay_tunnels.contains_key(&session_id) 
+        if state.relay_tunnels.len() >= MAX_RELAY_TUNNELS_PER_PEER
+            && !state.relay_tunnels.contains_key(&session_id)
         {
             tracing::warn!(
                 peer = ?identity,
@@ -880,32 +919,28 @@ impl SmartSock {
             );
             return None;
         }
-        
+
         state.relay_tunnels.insert(session_id, tunnel);
-        
+
         drop(peers);
         {
             let mut reverse = self.reverse_map.write().await;
             reverse.put(relay_addr, smart_addr);
         }
-        
+
         tracing::debug!(
             peer = ?identity,
             session = hex::encode(session_id),
             relay = %relay_addr,
             "added relay tunnel for peer"
         );
-        
+
         Some(smart_addr)
     }
-    
-    pub async fn remove_relay_tunnel(
-        &self,
-        identity: &Identity,
-        session_id: &[u8; 16],
-    ) {
+
+    pub async fn remove_relay_tunnel(&self, identity: &Identity, session_id: &[u8; 16]) {
         let smart_addr = SmartAddr::from_identity(identity);
-        
+
         let mut peers = self.peers.write().await;
         if let Some(state) = peers.get_mut(&smart_addr)
             && let Some(tunnel) = state.relay_tunnels.remove(session_id)
@@ -913,7 +948,7 @@ impl SmartSock {
             drop(peers);
             let mut reverse = self.reverse_map.write().await;
             reverse.pop(&tunnel.relay_addr);
-            
+
             tracing::debug!(
                 peer = ?identity,
                 session = hex::encode(session_id),
@@ -921,15 +956,15 @@ impl SmartSock {
             );
         }
     }
-    
+
     /// Remove all relay tunnels for a peer. Called when a connection is closed.
     pub async fn cleanup_peer_relay_tunnels(&self, identity: &Identity) -> Vec<[u8; 16]> {
         let smart_addr = SmartAddr::from_identity(identity);
-        
+
         // First pass: collect relay addresses and session IDs while holding the lock
         let mut removed_sessions = Vec::new();
         let mut relay_addrs_to_remove = Vec::new();
-        
+
         {
             let mut peers = self.peers.write().await;
             if let Some(state) = peers.get_mut(&smart_addr) {
@@ -942,7 +977,7 @@ impl SmartSock {
                 }
             }
         } // Release peers lock before acquiring reverse_map lock
-        
+
         // Second pass: clean up reverse map entries
         if !relay_addrs_to_remove.is_empty() {
             let mut reverse = self.reverse_map.write().await;
@@ -950,7 +985,7 @@ impl SmartSock {
                 reverse.pop(&relay_addr);
             }
         }
-        
+
         if !removed_sessions.is_empty() {
             tracing::debug!(
                 peer = ?identity,
@@ -958,31 +993,25 @@ impl SmartSock {
                 "cleaned up all relay tunnels for peer"
             );
         }
-        
+
         removed_sessions
     }
-    
+
     /// Get contact information for a peer from SmartSock's peer registry (async version).
     pub async fn get_peer_contact(&self, identity: &Identity) -> Option<Contact> {
         let smart_addr = SmartAddr::from_identity(identity);
         let peers = self.peers.read().await;
         let state = peers.get(&smart_addr)?;
-        
+
         // Build contact from peer state
-        let addrs: Vec<String> = state.direct_addrs.iter()
-            .map(|a| a.to_string())
-            .collect();
-        
+        let addrs: Vec<String> = state.direct_addrs.iter().map(std::string::ToString::to_string).collect();
+
         Some(Contact::unsigned(state.identity, addrs))
     }
-    
-    pub async fn use_relay_path(
-        &self,
-        identity: &Identity,
-        session_id: [u8; 16],
-    ) -> bool {
+
+    pub async fn use_relay_path(&self, identity: &Identity, session_id: [u8; 16]) -> bool {
         let smart_addr = SmartAddr::from_identity(identity);
-        
+
         let mut peers = self.peers.write().await;
         if let Some(state) = peers.get_mut(&smart_addr)
             && let Some(tunnel) = state.relay_tunnels.get(&session_id)
@@ -1001,14 +1030,10 @@ impl SmartSock {
         }
         false
     }
-    
-    pub async fn use_direct_path(
-        &self,
-        identity: &Identity,
-        addr: SocketAddr,
-    ) -> bool {
+
+    pub async fn use_direct_path(&self, identity: &Identity, addr: SocketAddr) -> bool {
         let smart_addr = SmartAddr::from_identity(identity);
-        
+
         let mut peers = self.peers.write().await;
         if let Some(state) = peers.get_mut(&smart_addr) {
             state.active_path = Some(PathChoice::Direct {
@@ -1024,32 +1049,32 @@ impl SmartSock {
         }
         false
     }
-    
+
     /// Check if a peer's active path is through a relay.
-    /// 
+    ///
     /// Returns `true` if the peer is registered and using a relay path,
     /// `false` if using direct path or peer is not registered.
     pub async fn is_peer_relayed(&self, identity: &Identity) -> bool {
         let smart_addr = SmartAddr::from_identity(identity);
         let peers = self.peers.read().await;
-        peers.get(&smart_addr)
-            .map(|state| state.is_relayed())
-            .unwrap_or(false)
+        peers
+            .get(&smart_addr)
+            .is_some_and(PeerPathState::is_relayed)
     }
-    
+
     /// Get the active relay session ID for a peer, if using relay path.
-    /// 
+    ///
     /// Returns `Some(session_id)` if the peer is using a relay path,
     /// `None` if using direct path or peer is not registered.
     pub async fn peer_relay_session(&self, identity: &Identity) -> Option<[u8; 16]> {
         let smart_addr = SmartAddr::from_identity(identity);
         let peers = self.peers.read().await;
-        peers.get(&smart_addr).and_then(|state| {
-            match &state.active_path {
+        peers
+            .get(&smart_addr)
+            .and_then(|state| match &state.active_path {
                 Some(PathChoice::Relay { session_id, .. }) => Some(*session_id),
                 _ => None,
-            }
-        })
+            })
     }
 
     pub async fn update_path(&self, identity: &Identity, path: PathChoice) {
@@ -1064,37 +1089,33 @@ impl SmartSock {
             state.active_path = Some(path);
         }
     }
-    
+
     /// Send a probe packet through a relay tunnel to complete the relay session.
-    /// 
+    ///
     /// This is called by the receiving peer (B) after getting an IncomingConnection
     /// notification. The probe packet is a minimal CRLY-framed message that:
     /// 1. Registers B's UDP address with the relay
     /// 2. Triggers the relay to complete the session (learn B's address)
-    /// 
+    ///
     /// # Arguments
     /// * `peer` - The peer identity we're establishing the relay tunnel with
     /// * `session_id` - The relay session ID
-    pub async fn send_relay_probe(
-        &self,
-        peer: &Identity,
-        session_id: [u8; 16],
-    ) -> io::Result<()> {
+    pub async fn send_relay_probe(&self, peer: &Identity, session_id: [u8; 16]) -> io::Result<()> {
         let smart_addr = SmartAddr::from_identity(peer);
-        
+
         let relay_addr = {
             let peers = self.peers.read().await;
             let state = peers.get(&smart_addr).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "peer not registered")
             })?;
-            
+
             let tunnel = state.relay_tunnels.get(&session_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "relay tunnel not found")
             })?;
-            
+
             tunnel.relay_addr
         };
-        
+
         // Build a minimal CRLY probe packet: magic + session_id + minimal payload
         // The payload can be empty or contain a small marker - the relay just needs
         // to see the CRLY header to identify it as a relay packet
@@ -1103,19 +1124,19 @@ impl SmartSock {
         frame.extend_from_slice(&RELAY_MAGIC);
         frame.extend_from_slice(&session_id);
         frame.extend_from_slice(probe_payload);
-        
+
         self.inner.send_to(&frame, relay_addr).await?;
-        
+
         tracing::debug!(
             peer = ?peer,
             session = hex::encode(session_id),
             relay = %relay_addr,
             "sent relay probe to complete session"
         );
-        
+
         Ok(())
     }
-    
+
     pub async fn add_direct_candidate(&self, identity: &Identity, addr: SocketAddr) {
         let smart_addr = SmartAddr::from_identity(identity);
         let mut peers = self.peers.write().await;
@@ -1123,23 +1144,28 @@ impl SmartSock {
             state.add_direct_candidate(addr);
         }
         drop(peers);
-        
+
         let mut reverse = self.reverse_map.write().await;
         reverse.put(addr, smart_addr);
     }
-    
-    pub async fn add_relay_candidate(&self, identity: &Identity, relay_addr: SocketAddr, session_id: [u8; 16]) {
+
+    pub async fn add_relay_candidate(
+        &self,
+        identity: &Identity,
+        relay_addr: SocketAddr,
+        session_id: [u8; 16],
+    ) {
         let smart_addr = SmartAddr::from_identity(identity);
         let mut peers = self.peers.write().await;
         if let Some(state) = peers.get_mut(&smart_addr) {
             state.add_relay_candidate(relay_addr, session_id);
         }
     }
-    
+
     pub async fn generate_probes(&self) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut probes = Vec::new();
         let mut peers = self.peers.write().await;
-        
+
         for (_, state) in peers.iter_mut() {
             let addrs_to_probe = state.candidates_needing_probe();
             for addr in addrs_to_probe {
@@ -1148,14 +1174,14 @@ impl SmartSock {
                 }
             }
         }
-        
+
         probes
     }
-    
+
     pub async fn probe_all_paths(&self) -> io::Result<usize> {
         let probes = self.generate_probes().await;
         let count = probes.len();
-        
+
         for (addr, probe_bytes) in probes {
             if let Err(e) = self.inner.send_to(&probe_bytes, addr).await {
                 tracing::trace!(
@@ -1165,24 +1191,24 @@ impl SmartSock {
                 );
             }
         }
-        
+
         Ok(count)
     }
-    
+
     pub fn handle_probe_request(&self, data: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
         let request = PathProbeRequest::from_bytes(data)?;
         let response = PathProbeResponse::from_request(&request, from);
         Some(response.to_bytes())
     }
-    
+
     pub async fn handle_probe_response(&self, data: &[u8]) -> bool {
         let response = match PathProbeResponse::from_bytes(data) {
             Some(r) => r,
             None => return false,
         };
-        
+
         let rtt = Duration::from_millis(response.rtt_ms() as u64);
-        
+
         let mut peers = self.peers.write().await;
         for (_, state) in peers.iter_mut() {
             if state.handle_probe_response(response.tx_id, rtt) {
@@ -1190,10 +1216,10 @@ impl SmartSock {
                 return true;
             }
         }
-        
+
         false
     }
-    
+
     pub async fn expire_probes(&self) {
         let timeout = PATH_PROBE_INTERVAL * 2;
         let mut peers = self.peers.write().await;
@@ -1201,12 +1227,13 @@ impl SmartSock {
             state.expire_probes(timeout);
         }
     }
-    
+
     /// Clean up relay tunnels that have been idle longer than RELAY_TUNNEL_STALE_TIMEOUT.
     /// This provides defense-in-depth against leaks if connection-close cleanup is missed.
     pub async fn cleanup_stale_relay_tunnels(&self) -> usize {
-        let mut stale_tunnels: Vec<(SmartAddr, [u8; 16], std::net::SocketAddr, u64, Identity)> = Vec::new();
-        
+        let mut stale_tunnels: Vec<(SmartAddr, [u8; 16], std::net::SocketAddr, u64, Identity)> =
+            Vec::new();
+
         // First pass: identify stale tunnels while holding the lock
         {
             let peers = self.peers.read().await;
@@ -1224,11 +1251,11 @@ impl SmartSock {
                 }
             }
         }
-        
+
         if stale_tunnels.is_empty() {
             return 0;
         }
-        
+
         // Second pass: remove stale tunnels
         let mut removed_count = 0;
         {
@@ -1248,7 +1275,7 @@ impl SmartSock {
                 }
             }
         }
-        
+
         // Third pass: clean up reverse map
         if removed_count > 0 {
             let mut reverse = self.reverse_map.write().await;
@@ -1256,10 +1283,10 @@ impl SmartSock {
                 reverse.pop(&relay_addr);
             }
         }
-        
+
         removed_count
     }
-    
+
     pub async fn switch_to_best_paths(&self) {
         let switches: Vec<(Identity, PathChoice)> = {
             let mut peers = self.peers.write().await;
@@ -1271,7 +1298,7 @@ impl SmartSock {
             }
             switches
         };
-        
+
         // Notify handler of path switches (outside of lock)
         if !switches.is_empty()
             && let Some(handler) = self.get_path_event_handler().await
@@ -1281,7 +1308,7 @@ impl SmartSock {
             }
         }
     }
-    
+
     pub fn spawn_probe_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let sock = Arc::clone(self);
         tokio::spawn(async move {
@@ -1289,12 +1316,12 @@ impl SmartSock {
             // Run stale tunnel cleanup every 60 seconds (12 probe intervals)
             let mut cleanup_counter = 0u32;
             const CLEANUP_INTERVAL_TICKS: u32 = 12;
-            
+
             loop {
                 interval.tick().await;
-                
+
                 sock.expire_probes().await;
-                
+
                 match sock.probe_all_paths().await {
                     Ok(count) if count > 0 => {
                         tracing::trace!(probes_sent = count, "path probing tick");
@@ -1304,9 +1331,9 @@ impl SmartSock {
                     }
                     _ => {}
                 }
-                
+
                 sock.switch_to_best_paths().await;
-                
+
                 // Periodic cleanup of stale relay tunnels
                 cleanup_counter += 1;
                 if cleanup_counter >= CLEANUP_INTERVAL_TICKS {
@@ -1319,37 +1346,37 @@ impl SmartSock {
             }
         })
     }
-    
+
     pub fn inner_socket(&self) -> &Arc<tokio::net::UdpSocket> {
         &self.inner
     }
-    
+
     pub fn into_endpoint(
         self,
         server_config: quinn::ServerConfig,
     ) -> io::Result<(quinn::Endpoint, Arc<Self>)> {
         let smartsock = Arc::new(self);
-        
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| io::Error::other("no async runtime found"))?;
-        
+
+        let runtime =
+            quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(server_config),
             smartsock.clone(),
             runtime,
         )?;
-        
+
         Ok((endpoint, smartsock))
     }
-    
+
     pub async fn bind_endpoint(
         addr: std::net::SocketAddr,
         server_config: quinn::ServerConfig,
     ) -> io::Result<(quinn::Endpoint, Arc<Self>)> {
         let smartsock = Self::bind(addr).await?;
         let (endpoint, smartsock) = smartsock.into_endpoint(server_config)?;
-        
+
         // Spawn probe loop internally
         let probe_smartsock = smartsock.clone();
         tokio::spawn(async move {
@@ -1357,12 +1384,12 @@ impl SmartSock {
             // Run stale tunnel cleanup every 60 seconds (12 probe intervals)
             let mut cleanup_counter = 0u32;
             const CLEANUP_INTERVAL_TICKS: u32 = 12;
-            
+
             loop {
                 interval.tick().await;
-                
+
                 probe_smartsock.expire_probes().await;
-                
+
                 match probe_smartsock.probe_all_paths().await {
                     Ok(count) if count > 0 => {
                         tracing::trace!(probes_sent = count, "path probing tick");
@@ -1372,9 +1399,9 @@ impl SmartSock {
                     }
                     _ => {}
                 }
-                
+
                 probe_smartsock.switch_to_best_paths().await;
-                
+
                 // Periodic cleanup of stale relay tunnels
                 cleanup_counter += 1;
                 if cleanup_counter >= CLEANUP_INTERVAL_TICKS {
@@ -1386,7 +1413,7 @@ impl SmartSock {
                 }
             }
         });
-        
+
         Ok((endpoint, smartsock))
     }
 }
@@ -1421,85 +1448,78 @@ impl AsyncUdpSocket for SmartSock {
             inner: self.inner.clone(),
         })
     }
-    
+
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         if SmartAddr::is_smart_addr(&transmit.destination) {
             let smart_addr = SmartAddr(transmit.destination);
-            
+
             let peers_guard = match self.peers.try_read() {
                 Ok(guard) => guard,
                 Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "peer map locked"
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "peer map locked"));
                 }
             };
-            
-            let state = match peers_guard.get(&smart_addr) {
-                Some(s) => s,
-                None => {
-                    tracing::warn!(
-                        dest = ?transmit.destination,
-                        "no peer state for SmartAddr"
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "unknown peer"
-                    ));
-                }
+
+            let state = if let Some(s) = peers_guard.get(&smart_addr) { s } else {
+                tracing::warn!(
+                    dest = ?transmit.destination,
+                    "no peer state for SmartAddr"
+                );
+                return Err(io::Error::new(io::ErrorKind::NotConnected, "unknown peer"));
             };
-            
+
             match &state.active_path {
-                Some(PathChoice::Relay { relay_addr, session_id, .. }) => {
+                Some(PathChoice::Relay {
+                    relay_addr,
+                    session_id,
+                    ..
+                }) => {
                     if let Some(tunnel) = state.relay_tunnels.get(session_id) {
                         let frame = tunnel.encode_frame(transmit.contents);
                         let relay_dest = *relay_addr;
                         drop(peers_guard);
-                        
+
                         if frame.len() > MAX_RELAY_FRAME_SIZE {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
-                                "relay frame too large"
+                                "relay frame too large",
                             ));
                         }
-                        
-                        self.inner.try_send_to(&frame, relay_dest)
-                            .map(|_| ())
+
+                        self.inner.try_send_to(&frame, relay_dest).map(|_| ())
                     } else {
                         drop(peers_guard);
                         Err(io::Error::new(
                             io::ErrorKind::NotConnected,
-                            "relay tunnel not found"
+                            "relay tunnel not found",
                         ))
                     }
                 }
                 Some(PathChoice::Direct { addr, .. }) => {
                     let dest = *addr;
                     drop(peers_guard);
-                    self.inner.try_send_to(transmit.contents, dest)
-                        .map(|_| ())
+                    self.inner.try_send_to(transmit.contents, dest).map(|_| ())
                 }
                 None => {
                     if let Some(addr) = state.best_addr() {
                         drop(peers_guard);
-                        self.inner.try_send_to(transmit.contents, addr)
-                            .map(|_| ())
+                        self.inner.try_send_to(transmit.contents, addr).map(|_| ())
                     } else {
                         drop(peers_guard);
                         Err(io::Error::new(
                             io::ErrorKind::NotConnected,
-                            "no path to peer"
+                            "no path to peer",
                         ))
                     }
                 }
             }
         } else {
-            self.inner.try_send_to(transmit.contents, transmit.destination)
+            self.inner
+                .try_send_to(transmit.contents, transmit.destination)
                 .map(|_| ())
         }
     }
-    
+
     fn poll_recv(
         &self,
         cx: &mut Context,
@@ -1507,16 +1527,19 @@ impl AsyncUdpSocket for SmartSock {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         debug_assert!(!bufs.is_empty() && !meta.is_empty());
-        
+
+        // Maximum UDP datagram size - intentionally large for max-sized packets
+        #[allow(clippy::large_stack_arrays)]
         let mut buf = [0u8; 65535];
         let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
-        
+
         match self.inner.poll_recv_from(cx, &mut read_buf) {
             Poll::Ready(Ok(src_addr)) => {
                 let received = read_buf.filled();
-                
+
                 // Dispatch relay packets to relay server (multiplexing)
-                if received.len() >= 4 && received[0..4] == RELAY_MAGIC
+                if received.len() >= 4
+                    && received[0..4] == RELAY_MAGIC
                     && let Ok(guard) = self.udprelay.read()
                     && let Some(udprelay) = guard.as_ref()
                 {
@@ -1525,12 +1548,12 @@ impl AsyncUdpSocket for SmartSock {
                     tokio::spawn(async move {
                         udprelay.process_packet(&data, src_addr).await;
                     });
-                    
+
                     // Packet handled by relay server, skip for Quinn
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                
+
                 if PathProbeRequest::is_probe_request(received) {
                     if let Some(response_bytes) = self.handle_probe_request(received, src_addr) {
                         let _ = self.inner.try_send_to(&response_bytes, src_addr);
@@ -1538,7 +1561,7 @@ impl AsyncUdpSocket for SmartSock {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                
+
                 if PathProbeResponse::is_probe_response(received) {
                     if let Some(response) = PathProbeResponse::from_bytes(received) {
                         let rtt = Duration::from_millis(response.rtt_ms() as u64);
@@ -1554,48 +1577,44 @@ impl AsyncUdpSocket for SmartSock {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                
-                let (payload, translated_addr, smart_addr_for_recv) = if let Some((session_id, payload)) = RelayTunnel::decode_frame(received) {
-                    // SECURITY: Use peek() for read-only lookup without updating LRU order.
-                    // This avoids requiring mutable access in the hot path.
-                    let smart_addr = match self.reverse_map.try_read() {
-                        Ok(guard) => {
-                            guard.peek(&src_addr).copied()
-                        }
-                        Err(_) => None,
-                    };
-                    
-                    let verified_smart_addr = smart_addr.and_then(|sa| {
-                        match self.peers.try_read() {
-                            Ok(peers) => {
-                                if let Some(state) = peers.get(&sa)
-                                    && state.relay_tunnels.contains_key(&session_id)
-                                {
-                                    return Some(sa);
+
+                let (payload, translated_addr, smart_addr_for_recv) =
+                    if let Some((session_id, payload)) = RelayTunnel::decode_frame(received) {
+                        // SECURITY: Use peek() for read-only lookup without updating LRU order.
+                        // This avoids requiring mutable access in the hot path.
+                        let smart_addr = match self.reverse_map.try_read() {
+                            Ok(guard) => guard.peek(&src_addr).copied(),
+                            Err(_) => None,
+                        };
+
+                        let verified_smart_addr =
+                            smart_addr.and_then(|sa| match self.peers.try_read() {
+                                Ok(peers) => {
+                                    if let Some(state) = peers.get(&sa)
+                                        && state.relay_tunnels.contains_key(&session_id)
+                                    {
+                                        return Some(sa);
+                                    }
+                                    None
                                 }
-                                None
-                            }
-                            Err(_) => Some(sa),
-                        }
-                    });
-                    
-                    let addr = verified_smart_addr
-                        .map(|sa| sa.0)
-                        .unwrap_or(src_addr);
-                    
-                    (payload, addr, verified_smart_addr)
-                } else {
-                    // For non-relay packets, do NOT rewrite the observed source address.
-                    // QUIC connection tracking is keyed on the real remote SocketAddr;
-                    // rewriting this to a synthetic SmartAddr can cause handshakes and
-                    // existing connections to stall or be dropped.
-                    let sa = match self.reverse_map.try_read() {
-                        Ok(guard) => guard.peek(&src_addr).copied(),
-                        Err(_) => None,
+                                Err(_) => Some(sa),
+                            });
+
+                        let addr = verified_smart_addr.map_or(src_addr, |sa| sa.0);
+
+                        (payload, addr, verified_smart_addr)
+                    } else {
+                        // For non-relay packets, do NOT rewrite the observed source address.
+                        // QUIC connection tracking is keyed on the real remote SocketAddr;
+                        // rewriting this to a synthetic SmartAddr can cause handshakes and
+                        // existing connections to stall or be dropped.
+                        let sa = match self.reverse_map.try_read() {
+                            Ok(guard) => guard.peek(&src_addr).copied(),
+                            Err(_) => None,
+                        };
+                        (received, src_addr, sa)
                     };
-                    (received, src_addr, sa)
-                };
-                
+
                 // Update last_recv for LRU eviction tracking
                 if let Some(sa) = smart_addr_for_recv
                     && let Ok(mut peers) = self.peers.try_write()
@@ -1603,10 +1622,10 @@ impl AsyncUdpSocket for SmartSock {
                 {
                     state.last_recv = Some(Instant::now());
                 }
-                
+
                 let copy_len = payload.len().min(bufs[0].len());
                 bufs[0][..copy_len].copy_from_slice(&payload[..copy_len]);
-                
+
                 meta[0] = RecvMeta {
                     addr: translated_addr,
                     len: copy_len,
@@ -1614,26 +1633,26 @@ impl AsyncUdpSocket for SmartSock {
                     ecn: None,
                     dst_ip: None,
                 };
-                
+
                 Poll::Ready(Ok(1))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
     }
-    
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
     }
-    
+
     fn max_transmit_segments(&self) -> usize {
         1
     }
-    
+
     fn max_receive_segments(&self) -> usize {
         1
     }
-    
+
     fn may_fragment(&self) -> bool {
         true
     }
@@ -1642,74 +1661,74 @@ impl AsyncUdpSocket for SmartSock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::{RelayTunnel, RELAY_MAGIC, RELAY_HEADER_SIZE};
+    use crate::relay::{RELAY_HEADER_SIZE, RELAY_MAGIC, RelayTunnel};
 
     #[test]
     fn test_smart_addr_from_identity() {
         let identity = Identity::from([1u8; 32]);
         let addr = SmartAddr::from_identity(&identity);
-        
+
         assert!(SmartAddr::is_smart_addr(&addr.socket_addr()));
-        
+
         let addr2 = SmartAddr::from_identity(&identity);
         assert_eq!(addr.socket_addr(), addr2.socket_addr());
-        
+
         let other = Identity::from([2u8; 32]);
         let addr3 = SmartAddr::from_identity(&other);
         assert_ne!(addr.socket_addr(), addr3.socket_addr());
     }
-    
+
     #[test]
     fn test_smart_addr_detection() {
         let identity = Identity::from([1u8; 32]);
         let smart = SmartAddr::from_identity(&identity);
-        
+
         assert!(SmartAddr::is_smart_addr(&smart.socket_addr()));
-        
+
         let regular_v4: SocketAddr = "192.168.1.1:1234".parse().unwrap();
         let regular_v6: SocketAddr = "[2001:db8::1]:1234".parse().unwrap();
-        
+
         assert!(!SmartAddr::is_smart_addr(&regular_v4));
         assert!(!SmartAddr::is_smart_addr(&regular_v6));
     }
-    
+
     #[test]
     fn test_relay_frame_encoding_decoding() {
         let identity = Identity::from([42u8; 32]);
         let session_id = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let relay_addr: SocketAddr = "192.168.1.100:4433".parse().unwrap();
-        
+
         let tunnel = RelayTunnel::new(session_id, relay_addr, identity);
-        
+
         let payload = b"Hello, QUIC packet!";
         let frame = tunnel.encode_frame(payload);
-        
+
         assert_eq!(frame.len(), RELAY_HEADER_SIZE + payload.len());
-        
+
         assert_eq!(&frame[0..4], &RELAY_MAGIC);
-        
+
         assert_eq!(&frame[4..20], &session_id);
-        
+
         assert_eq!(&frame[RELAY_HEADER_SIZE..], payload.as_slice());
-        
+
         let decoded = RelayTunnel::decode_frame(&frame);
         assert!(decoded.is_some());
-        
+
         let (decoded_session, decoded_payload) = decoded.unwrap();
         assert_eq!(decoded_session, session_id);
         assert_eq!(decoded_payload, payload.as_slice());
     }
-    
+
     #[test]
     fn test_relay_frame_decode_rejects_invalid() {
         assert!(RelayTunnel::decode_frame(&[1, 2, 3]).is_none());
-        
+
         let mut bad_magic = [0u8; 30];
         bad_magic[0..4].copy_from_slice(b"NOPE");
         assert!(RelayTunnel::decode_frame(&bad_magic).is_none());
-        
+
         assert!(RelayTunnel::decode_frame(&[]).is_none());
-        
+
         let mut header_only = [0u8; RELAY_HEADER_SIZE];
         header_only[0..4].copy_from_slice(&RELAY_MAGIC);
         let result = RelayTunnel::decode_frame(&header_only);
@@ -1717,148 +1736,168 @@ mod tests {
         let (_, payload) = result.unwrap();
         assert!(payload.is_empty());
     }
-    
+
     #[test]
     fn test_path_probe_request_encoding_decoding() {
         let probe = PathProbeRequest::new(12345);
         let bytes = probe.to_bytes();
-        
+
         assert_eq!(&bytes[0..4], &PROBE_MAGIC);
         assert_eq!(bytes[4], PROBE_TYPE_REQUEST);
-        
+
         let decoded = PathProbeRequest::from_bytes(&bytes);
         assert!(decoded.is_some());
         let decoded = decoded.unwrap();
         assert_eq!(decoded.tx_id, 12345);
         assert_eq!(decoded.timestamp_ms, probe.timestamp_ms);
-        
+
         assert!(PathProbeRequest::is_probe_request(&bytes));
         assert!(!PathProbeResponse::is_probe_response(&bytes));
     }
-    
+
     #[test]
     fn test_path_probe_response_encoding_decoding() {
         let request = PathProbeRequest::new(67890);
         let observed: SocketAddr = "192.168.1.1:4433".parse().unwrap();
         let response = PathProbeResponse::from_request(&request, observed);
-        
+
         let bytes = response.to_bytes();
-        
+
         assert_eq!(&bytes[0..4], &PROBE_MAGIC);
         assert_eq!(bytes[4], PROBE_TYPE_RESPONSE);
-        
+
         let decoded = PathProbeResponse::from_bytes(&bytes);
         assert!(decoded.is_some());
         let decoded = decoded.unwrap();
         assert_eq!(decoded.tx_id, 67890);
         assert_eq!(decoded.echo_timestamp_ms, request.timestamp_ms);
         assert_eq!(decoded.observed_addr, observed);
-        
+
         assert!(PathProbeResponse::is_probe_response(&bytes));
         assert!(!PathProbeRequest::is_probe_request(&bytes));
     }
-    
+
     #[test]
     fn test_path_probe_response_ipv6() {
         let request = PathProbeRequest::new(99999);
         let observed: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
         let response = PathProbeResponse::from_request(&request, observed);
-        
+
         let bytes = response.to_bytes();
         let decoded = PathProbeResponse::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(decoded.observed_addr, observed);
     }
-    
+
     #[test]
     fn test_path_candidate_state_machine() {
         let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
         let mut candidate = PathCandidateInfo::new_direct(addr);
-        
+
         assert_eq!(candidate.state, PathCandidateState::Unknown);
         assert!(candidate.needs_probe());
         assert!(!candidate.is_usable());
-        
+
         candidate.mark_probed();
         assert_eq!(candidate.state, PathCandidateState::Probing);
-        
+
         candidate.record_success(Duration::from_millis(50));
         assert_eq!(candidate.state, PathCandidateState::Active);
         assert!(candidate.is_usable());
         assert!(candidate.rtt_ms.is_some());
-        
+
         let rtt = candidate.rtt_ms.unwrap();
         assert!(rtt > 40.0 && rtt < 60.0);
-        
+
         candidate.record_success(Duration::from_millis(100));
         let new_rtt = candidate.rtt_ms.unwrap();
         assert!(new_rtt > 55.0 && new_rtt < 65.0);
     }
-    
+
     #[test]
     fn test_path_candidate_failure_handling() {
         let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
         let mut candidate = PathCandidateInfo::new_direct(addr);
-        
+
         candidate.mark_probed();
         candidate.record_success(Duration::from_millis(50));
-        
+
         for _ in 0..MAX_PROBE_FAILURES {
             assert_ne!(candidate.state, PathCandidateState::Failed);
             candidate.record_failure();
         }
-        
+
         assert_eq!(candidate.state, PathCandidateState::Failed);
         assert!(!candidate.needs_probe());
     }
-    
+
     #[test]
     fn test_peer_path_state_best_path_selection() {
         let identity = Identity::from([1u8; 32]);
         let mut state = PeerPathState::new(identity);
-        
+
         let direct1: SocketAddr = "10.0.0.1:1234".parse().unwrap();
         let direct2: SocketAddr = "10.0.0.2:1234".parse().unwrap();
         let relay: SocketAddr = "192.168.1.100:4433".parse().unwrap();
-        
+
         state.add_direct_candidate(direct1);
         state.add_direct_candidate(direct2);
         state.add_relay_candidate(relay, [0xAB; 16]);
-        
-        state.candidates.get_mut(&direct1).unwrap().record_success(Duration::from_millis(50));
-        
-        state.candidates.get_mut(&direct2).unwrap().record_success(Duration::from_millis(30));
-        
-        state.candidates.get_mut(&relay).unwrap().record_success(Duration::from_millis(20));
-        
+
+        state
+            .candidates
+            .get_mut(&direct1)
+            .unwrap()
+            .record_success(Duration::from_millis(50));
+
+        state
+            .candidates
+            .get_mut(&direct2)
+            .unwrap()
+            .record_success(Duration::from_millis(30));
+
+        state
+            .candidates
+            .get_mut(&relay)
+            .unwrap()
+            .record_success(Duration::from_millis(20));
+
         let best = state.select_best_path();
         assert!(best.is_some());
         let best = best.unwrap();
-        
+
         match best {
             PathChoice::Direct { addr, .. } => assert_eq!(addr, direct2),
             _ => panic!("Expected direct path"),
         }
     }
-    
+
     #[test]
     fn test_peer_path_state_relay_wins_when_much_faster() {
         let identity = Identity::from([2u8; 32]);
         let mut state = PeerPathState::new(identity);
-        
+
         let direct: SocketAddr = "10.0.0.1:1234".parse().unwrap();
         let relay: SocketAddr = "192.168.1.100:4433".parse().unwrap();
-        
+
         state.add_direct_candidate(direct);
         state.add_relay_candidate(relay, [0xCD; 16]);
-        
-        state.candidates.get_mut(&direct).unwrap().record_success(Duration::from_millis(150));
-        
-        state.candidates.get_mut(&relay).unwrap().record_success(Duration::from_millis(50));
-        
+
+        state
+            .candidates
+            .get_mut(&direct)
+            .unwrap()
+            .record_success(Duration::from_millis(150));
+
+        state
+            .candidates
+            .get_mut(&relay)
+            .unwrap()
+            .record_success(Duration::from_millis(50));
+
         let best = state.select_best_path();
         assert!(best.is_some());
-        
+
         match best.unwrap() {
             PathChoice::Relay { relay_addr, .. } => assert_eq!(relay_addr, relay),
             _ => panic!("Expected relay path"),
@@ -1869,7 +1908,7 @@ mod tests {
     fn peer_path_state_new_and_fields() {
         let id = Identity::from_bytes([1u8; 32]);
         let state = PeerPathState::new(id);
-        
+
         assert_eq!(state.identity, id);
         assert!(state.direct_addrs.is_empty());
         assert!(state.relay_tunnels.is_empty());
@@ -1877,7 +1916,7 @@ mod tests {
         assert!(state.last_recv.is_none());
         assert!(state.candidates.is_empty());
         assert!(state.pending_probes.is_empty());
-        
+
         let _debug = format!("{:?}", state);
     }
 }

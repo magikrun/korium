@@ -23,10 +23,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::dht::Key;
 use crate::identity::{Contact, Identity};
 use crate::messages::{GossipSubRequest, RelayResponse};
-use crate::dht::Key;
-
 
 /// DHT node operations for distributed routing and storage.
 #[async_trait]
@@ -42,12 +41,11 @@ pub trait DhtNodeRpc: Send + Sync + 'static {
 
     /// Ping a node to check liveness.
     async fn ping(&self, to: &Contact) -> Result<()>;
-    
+
     /// Ask a peer to check if we are reachable by connecting back to the given address.
     /// Returns true if the peer successfully connected back.
     async fn check_reachability(&self, to: &Contact, probe_addr: &str) -> Result<bool>;
 }
-
 
 /// GossipSub epidemic broadcast protocol operations.
 #[async_trait]
@@ -55,7 +53,6 @@ pub trait GossipSubRpc: Send + Sync {
     /// Send a GossipSub protocol message to a peer.
     async fn send_gossipsub(&self, to: &Contact, message: GossipSubRequest) -> Result<()>;
 }
-
 
 /// Relay operations for NAT traversal.
 #[async_trait]
@@ -69,7 +66,7 @@ pub trait RelayRpc: Send + Sync {
     ) -> Result<()>;
 
     /// Request a mesh peer to act as a relay (Phase 4: opportunistic mesh relay).
-    /// 
+    ///
     /// Unlike dedicated relay servers, mesh peers provide lightweight relay
     /// for NAT-bound peers they're already connected to.
     async fn request_mesh_relay(
@@ -81,12 +78,11 @@ pub trait RelayRpc: Send + Sync {
     ) -> Result<RelayResponse>;
 }
 
-
 /// Plain point-to-point request-response messaging.
 #[async_trait]
 pub trait PlainRpc: Send + Sync {
     /// Send a request directly to a peer and receive a response.
-    /// 
+    ///
     /// The caller sends a request and blocks until a response is received.
     async fn send(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>>;
 }

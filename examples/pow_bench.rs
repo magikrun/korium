@@ -6,12 +6,12 @@ use korium::Node;
 fn main() {
     println!("Benchmarking PoW at difficulty 16 (5 iterations)...\n");
     println!("(Using internal timing - Node::bind uses generate() not generate_with_pow())\n");
-    
+
     // We can't directly access Keypair::generate_with_pow from examples
     // because identity module is private. Let's measure node creation instead.
     let mut total_ms = 0u128;
     let rt = tokio::runtime::Runtime::new().unwrap();
-    
+
     for i in 1..=5 {
         let start = Instant::now();
         rt.block_on(async {

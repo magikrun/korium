@@ -38,7 +38,7 @@ use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use blake3::hash;
 use lru::LruCache;
 use tokio::sync::{mpsc, oneshot};
@@ -46,7 +46,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use crate::identity::{distance_cmp, Contact, FreshnessError, Identity, Keypair, Provenance};
+use crate::identity::{Contact, FreshnessError, Identity, Keypair, Provenance, distance_cmp};
 use crate::protocols::DhtNodeRpc;
 
 /// Maximum age for endpoint records before they're considered stale (24 hours).
@@ -63,7 +63,7 @@ const OFFLOAD_BASE_DELAY_MS: u64 = 100;
 pub type Key = [u8; 32];
 
 /// Classification of DHT value types for differentiated rate limiting.
-/// 
+///
 /// SECURITY: Content-addressed values bypass PoW verification and are therefore
 /// subject to stricter rate limiting than identity-keyed Contact records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,11 +85,11 @@ pub enum ValueType {
 const MAX_CONTACT_RECORD_SIZE: usize = 16 * 1024;
 
 /// Classify a key-value pair and validate it.
-/// 
+///
 /// Returns `ValueType::Invalid` if the value cannot be stored.
 /// Returns `ValueType::ContentAddressed` for hash(value) == key (no PoW).
 /// Returns `ValueType::IdentityKeyed` for valid, fresh, PoW-verified Contact records.
-/// 
+///
 /// SECURITY: This classification is used to apply differentiated rate limiting.
 /// Content-addressed stores are rate-limited more strictly since they bypass
 /// the computational cost of PoW identity generation.
@@ -149,7 +149,11 @@ pub fn classify_key_value_pair(key: &Key, value: &[u8]) -> ValueType {
                     "DHT store rejected: Contact record has invalid signature"
                 );
             }
-            Err(FreshnessError::ClockSkewFuture { record_ts, local_ts, drift_ms }) => {
+            Err(FreshnessError::ClockSkewFuture {
+                record_ts,
+                local_ts,
+                drift_ms,
+            }) => {
                 warn!(
                     key = hex::encode(&key[..8]),
                     identity = hex::encode(&record.identity.as_bytes()[..8]),
@@ -159,7 +163,11 @@ pub fn classify_key_value_pair(key: &Key, value: &[u8]) -> ValueType {
                     "DHT store rejected: Contact record timestamp in future (clock skew detected)"
                 );
             }
-            Err(FreshnessError::Stale { record_ts, local_ts, age_ms }) => {
+            Err(FreshnessError::Stale {
+                record_ts,
+                local_ts,
+                age_ms,
+            }) => {
                 debug!(
                     key = hex::encode(&key[..8]),
                     identity = hex::encode(&record.identity.as_bytes()[..8]),
@@ -181,7 +189,6 @@ pub fn classify_key_value_pair(key: &Key, value: &[u8]) -> ValueType {
     );
     ValueType::Invalid
 }
-
 
 // ============================================================================
 // Routing Table (XOR-Metric)
@@ -230,7 +237,11 @@ const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
 /// Maximum direct peer insertions per IP per rate window.
 /// SECURITY: Limits routing table pollution from direct connections without PoW.
 /// An attacker with many IPs can still populate the table, but must pay connection cost.
-const DIRECT_PEER_PER_IP_LIMIT: usize = 20;
+///
+/// SECURITY HARDENING: Reduced from 20 to 5 to strengthen Sybil resistance.
+/// With 50 IPs, an attacker can now only insert 250 contacts (vs 1000 previously).
+/// This better aligns with the PoW cost model for identity generation.
+const DIRECT_PEER_PER_IP_LIMIT: usize = 5;
 
 /// Time window for direct peer IP rate limiting.
 const DIRECT_PEER_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -239,12 +250,11 @@ const DIRECT_PEER_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_DIRECT_PEER_TRACKED_IPS: usize = 1_000;
 
 /// Whether to enforce Proof-of-Work verification for routing table insertion.
-/// 
+///
 /// SECURITY (S/Kademlia): When enabled, contacts must have a valid PoW proof
 /// (`contact.verify_pow() == true`) to be accepted into the routing table.
 /// This prevents Sybil attacks by making identity generation computationally expensive.
 pub const ENFORCE_POW_FOR_ROUTING: bool = true;
-
 
 #[derive(Debug, Clone, Copy)]
 struct RoutingInsertionBucket {
@@ -264,11 +274,11 @@ impl RoutingInsertionBucket {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         let window_secs = ROUTING_INSERTION_RATE_WINDOW.as_secs_f64();
-        
+
         let rate = ROUTING_INSERTION_PER_PEER_LIMIT as f64 / window_secs;
         self.tokens = (self.tokens + elapsed * rate).min(ROUTING_INSERTION_PER_PEER_LIMIT as f64);
         self.last_update = now;
-        
+
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -285,17 +295,17 @@ struct RoutingInsertionLimiter {
 impl RoutingInsertionLimiter {
     pub fn new() -> Self {
         Self {
-            buckets: LruCache::new(
-                NonZeroUsize::new(MAX_ROUTING_INSERTION_TRACKED_PEERS).unwrap()
-            ),
+            buckets: LruCache::new(NonZeroUsize::new(MAX_ROUTING_INSERTION_TRACKED_PEERS).unwrap()),
         }
     }
 
     pub fn allow_insertion(&mut self, from_peer: &Identity) -> bool {
-        let bucket = self.buckets.get_or_insert_mut(*from_peer, RoutingInsertionBucket::new);
+        let bucket = self
+            .buckets
+            .get_or_insert_mut(*from_peer, RoutingInsertionBucket::new);
         bucket.try_consume()
     }
-    
+
     #[cfg(test)]
     pub fn remaining_tokens(&mut self, peer: &Identity) -> f64 {
         if let Some(bucket) = self.buckets.get(peer) {
@@ -307,7 +317,7 @@ impl RoutingInsertionLimiter {
 }
 
 /// Rate limiter for direct peer insertions by IP address.
-/// 
+///
 /// SECURITY: Direct peers bypass PoW verification because their identity is
 /// verified via mTLS. However, an attacker with many IP addresses could exploit
 /// this to populate the routing table without paying PoW cost. This limiter
@@ -330,11 +340,11 @@ impl DirectPeerIpBucket {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         let window_secs = DIRECT_PEER_RATE_WINDOW.as_secs_f64();
-        
+
         let rate = DIRECT_PEER_PER_IP_LIMIT as f64 / window_secs;
         self.tokens = (self.tokens + elapsed * rate).min(DIRECT_PEER_PER_IP_LIMIT as f64);
         self.last_update = now;
-        
+
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -353,14 +363,14 @@ impl DirectPeerIpLimiter {
         Self {
             buckets: LruCache::new(
                 NonZeroUsize::new(MAX_DIRECT_PEER_TRACKED_IPS)
-                    .expect("MAX_DIRECT_PEER_TRACKED_IPS must be non-zero")
+                    .expect("MAX_DIRECT_PEER_TRACKED_IPS must be non-zero"),
             ),
         }
     }
 
     /// Check if a direct peer from the given IP should be allowed.
     /// Extracts IP from the contact's primary address.
-    /// 
+    ///
     /// # Security
     /// Fail-closed: Unparseable addresses are denied (prevents bypass via malformed contacts).
     pub fn allow_direct_peer(&mut self, contact: &Contact) -> bool {
@@ -374,12 +384,11 @@ impl DirectPeerIpLimiter {
             }
             None => return false, // SECURITY: Fail-closed - no address = deny
         };
-        
+
         let bucket = self.buckets.get_or_insert_mut(ip, DirectPeerIpBucket::new);
         bucket.try_consume()
     }
 }
-
 
 #[derive(Debug, Clone)]
 struct RoutingBucket {
@@ -427,7 +436,11 @@ impl RoutingBucket {
     }
 
     fn touch(&mut self, contact: Contact, k: usize) -> BucketTouchOutcome {
-        if let Some(pos) = self.contacts.iter().position(|c| c.identity == contact.identity) {
+        if let Some(pos) = self
+            .contacts
+            .iter()
+            .position(|c| c.identity == contact.identity)
+        {
             let existing = self.contacts.remove(pos);
             // Prefer signed/newer contact over unsigned/older one
             let updated = if contact.signature.len() > existing.signature.len()
@@ -448,7 +461,10 @@ impl RoutingBucket {
             self.mark_refreshed();
             BucketTouchOutcome::Inserted
         } else {
-            debug_assert!(!self.contacts.is_empty(), "bucket len >= k but contacts empty");
+            debug_assert!(
+                !self.contacts.is_empty(),
+                "bucket len >= k but contacts empty"
+            );
             let oldest = self
                 .contacts
                 .first()
@@ -481,7 +497,6 @@ impl RoutingBucket {
     }
 }
 
-
 fn bucket_index(self_id: &Identity, other: &Identity) -> usize {
     let dist = self_id.xor_distance(other);
     for (byte_idx, byte) in dist.iter().enumerate() {
@@ -496,7 +511,7 @@ fn bucket_index(self_id: &Identity, other: &Identity) -> usize {
 
 fn random_id_for_bucket(self_id: &Identity, bucket_idx: usize) -> Identity {
     let self_bytes = self_id.as_bytes();
-    
+
     let mut distance = [0u8; 32];
     if getrandom::getrandom(&mut distance).is_err() {
         for (i, byte) in distance.iter_mut().enumerate() {
@@ -522,7 +537,6 @@ fn random_id_for_bucket(self_id: &Identity, bucket_idx: usize) -> Identity {
 
     Identity::from_bytes(target)
 }
-
 
 #[derive(Debug)]
 pub struct RoutingTable {
@@ -593,13 +607,13 @@ impl RoutingTable {
             dist: [u8; 32],
             contact: Contact,
         }
-        
+
         impl Ord for DistEndpointInfo {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
                 distance_cmp(&self.dist, &other.dist)
             }
         }
-        
+
         impl PartialOrd for DistEndpointInfo {
             fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
                 Some(self.cmp(other))
@@ -611,13 +625,19 @@ impl RoutingTable {
         for bucket in &self.buckets {
             for contact in &bucket.contacts {
                 let dist = contact.identity.xor_distance(target);
-                
+
                 if heap.len() < k {
-                    heap.push(DistEndpointInfo { dist, contact: contact.clone() });
+                    heap.push(DistEndpointInfo {
+                        dist,
+                        contact: contact.clone(),
+                    });
                 } else if let Some(max_entry) = heap.peek()
                     && distance_cmp(&dist, &max_entry.dist) == std::cmp::Ordering::Less
                 {
-                    heap.push(DistEndpointInfo { dist, contact: contact.clone() });
+                    heap.push(DistEndpointInfo {
+                        dist,
+                        contact: contact.clone(),
+                    });
                     heap.pop();
                 }
             }
@@ -681,7 +701,6 @@ impl RoutingTable {
             .cloned()
     }
 }
-
 
 // ============================================================================
 // Local Storage (DHT Key-Value Store)
@@ -869,7 +888,7 @@ impl PeerStorageStats {
     /// Content-addressed stores have a stricter limit since they bypass PoW.
     fn is_rate_limited(&mut self, value_type: ValueType) -> bool {
         let now = Instant::now();
-        
+
         // Clean up expired entries from general store requests
         while let Some(front) = self.store_requests.front() {
             if now.duration_since(*front) > PER_PEER_RATE_WINDOW {
@@ -878,12 +897,12 @@ impl PeerStorageStats {
                 break;
             }
         }
-        
+
         // Check general rate limit
         if self.store_requests.len() >= PER_PEER_RATE_LIMIT {
             return true;
         }
-        
+
         // For content-addressed values, apply stricter rate limit
         if value_type == ValueType::ContentAddressed {
             // Clean up expired entries from content-addressed requests
@@ -894,7 +913,7 @@ impl PeerStorageStats {
                     break;
                 }
             }
-            
+
             // SECURITY: Stricter limit for content-addressed (no PoW)
             let content_limit = PER_PEER_RATE_LIMIT / CONTENT_ADDRESSED_RATE_DIVISOR;
             if self.content_addressed_requests.len() >= content_limit {
@@ -907,7 +926,7 @@ impl PeerStorageStats {
                 return true;
             }
         }
-        
+
         false
     }
 
@@ -915,7 +934,7 @@ impl PeerStorageStats {
         self.bytes_stored = self.bytes_stored.saturating_add(value_size);
         self.entry_count = self.entry_count.saturating_add(1);
         self.store_requests.push_back(Instant::now());
-        
+
         // Track content-addressed stores separately for stricter limiting
         if value_type == ValueType::ContentAddressed {
             self.content_addressed_requests.push_back(Instant::now());
@@ -961,7 +980,8 @@ struct LocalStore {
 impl LocalStore {
     pub fn new() -> Self {
         let cap = NonZeroUsize::new(LOCAL_STORE_MAX_ENTRIES).expect("capacity must be non-zero");
-        let peer_stats_cap = NonZeroUsize::new(MAX_TRACKED_PEERS).expect("peer stats capacity must be non-zero");
+        let peer_stats_cap =
+            NonZeroUsize::new(MAX_TRACKED_PEERS).expect("peer stats capacity must be non-zero");
         Self {
             cache: LruCache::new(cap),
             pressure: PressureMonitor::new(),
@@ -983,7 +1003,12 @@ impl LocalStore {
 
     /// Check if a store request from the given peer would be allowed.
     /// The value_type determines which rate limit is applied (stricter for content-addressed).
-    pub fn check_store_allowed(&mut self, peer_id: &Identity, value_size: usize, value_type: ValueType) -> Result<(), StoreRejection> {
+    pub fn check_store_allowed(
+        &mut self,
+        peer_id: &Identity,
+        value_size: usize,
+        value_type: ValueType,
+    ) -> Result<(), StoreRejection> {
         if value_size > MAX_VALUE_SIZE {
             debug!(
                 peer = ?hex::encode(&peer_id.as_bytes()[..8]),
@@ -994,7 +1019,9 @@ impl LocalStore {
             return Err(StoreRejection::ValueTooLarge);
         }
 
-        let stats = self.peer_stats.get_or_insert_mut(*peer_id, PeerStorageStats::default);
+        let stats = self
+            .peer_stats
+            .get_or_insert_mut(*peer_id, PeerStorageStats::default);
 
         if stats.is_rate_limited(value_type) {
             debug!(
@@ -1020,7 +1047,13 @@ impl LocalStore {
 
     /// Store a key-value pair, returning any entries that were evicted due to pressure.
     /// The value_type determines rate limiting (stricter for content-addressed values).
-    pub fn store(&mut self, key: Key, value: &[u8], stored_by: Identity, value_type: ValueType) -> Vec<(Key, Vec<u8>)> {
+    pub fn store(
+        &mut self,
+        key: Key,
+        value: &[u8],
+        stored_by: Identity,
+        value_type: ValueType,
+    ) -> Vec<(Key, Vec<u8>)> {
         if value.len() > MAX_VALUE_SIZE {
             warn!(
                 size = value.len(),
@@ -1052,7 +1085,9 @@ impl LocalStore {
             stored_at: now,
         };
 
-        let stats = self.peer_stats.get_or_insert_mut(stored_by, PeerStorageStats::default);
+        let stats = self
+            .peer_stats
+            .get_or_insert_mut(stored_by, PeerStorageStats::default);
         stats.record_store(entry.value.len(), value_type);
 
         self.pressure.record_store(entry.value.len());
@@ -1138,7 +1173,7 @@ impl LocalStore {
             entry.access_count = entry.access_count.saturating_add(1);
             return Some(entry.value.clone());
         }
-        
+
         if let Some(expired) = self.cache.pop(key) {
             self.pressure.record_evict(expired.value.len());
             if let Some(stats) = self.peer_stats.get_mut(&expired.stored_by) {
@@ -1161,12 +1196,13 @@ impl LocalStore {
         // LruCache automatically evicts when at capacity, so we just need to
         // identify and remove truly empty entries. Collect keys first to avoid
         // borrow issues.
-        let empty_peers: Vec<Identity> = self.peer_stats
+        let empty_peers: Vec<Identity> = self
+            .peer_stats
             .iter()
             .filter(|(_, stats)| stats.entry_count == 0 && stats.store_requests.is_empty())
             .map(|(id, _)| *id)
             .collect();
-        
+
         for peer_id in empty_peers {
             self.peer_stats.pop(&peer_id);
         }
@@ -1219,12 +1255,11 @@ impl LocalStore {
     }
 }
 
-
 /// Window size for query statistics used in adaptive parameter tuning.
 const QUERY_STATS_WINDOW: usize = 100;
 
 /// Adaptive Kademlia parameters that adjust to network conditions.
-/// 
+///
 /// Tracks query success/failure history to dynamically adjust:
 /// - `k`: Replication factor (number of contacts per bucket)
 /// - `alpha`: Concurrency factor (parallel queries during lookup)
@@ -1314,7 +1349,6 @@ pub struct TelemetrySnapshot {
     pub concurrency: usize,
 }
 
-
 // ============================================================================
 // Tiering Configuration (Latency-Aware Routing)
 // ============================================================================
@@ -1345,7 +1379,7 @@ const TIERING_PENALTY_FACTOR: f32 = 1.5;
 const MAX_TIERING_TRACKED_PREFIXES: usize = 10_000;
 
 /// Tiering level for latency-based contact grouping.
-/// 
+///
 /// Contacts are grouped into tiers based on their /16 IP prefix's RTT.
 /// Tier 0 = fastest, higher tiers = progressively slower.
 /// This enables latency-aware routing during lookups.
@@ -1396,7 +1430,7 @@ impl PrefixRttStats {
             self.samples.pop_front();
         }
         self.samples.push_back(rtt_ms);
-        
+
         // Exponential moving average
         const ALPHA: f32 = 0.3;
         self.smoothed = ALPHA * rtt_ms + (1.0 - ALPHA) * self.smoothed;
@@ -1404,7 +1438,7 @@ impl PrefixRttStats {
 }
 
 /// Prefix-based latency tiering manager.
-/// 
+///
 /// Tracks RTT by /16 IP prefix instead of per-peer, enabling:
 /// - O(1) memory per prefix (~512KB for entire IPv4 space)
 /// - Immediate RTT estimates for unseen peers in known prefixes
@@ -1427,9 +1461,7 @@ struct TieringManager {
 impl TieringManager {
     pub fn new() -> Self {
         Self {
-            prefix_rtt: LruCache::new(
-                NonZeroUsize::new(MAX_TIERING_TRACKED_PREFIXES).unwrap()
-            ),
+            prefix_rtt: LruCache::new(NonZeroUsize::new(MAX_TIERING_TRACKED_PREFIXES).unwrap()),
             prefix_tiers: HashMap::new(),
             centroids: vec![150.0],
             last_recompute: Instant::now() - TIERING_RECOMPUTE_INTERVAL,
@@ -1442,8 +1474,10 @@ impl TieringManager {
     pub fn register_contact(&mut self, contact: &Contact) -> TieringLevel {
         if let Some(provenance) = contact.provenance() {
             // Ensure provenance is in LRU (touch it)
-            self.prefix_rtt.get_or_insert_mut(provenance, PrefixRttStats::default);
-            return self.prefix_tiers
+            self.prefix_rtt
+                .get_or_insert_mut(provenance, PrefixRttStats::default);
+            return self
+                .prefix_tiers
                 .get(&provenance)
                 .copied()
                 .unwrap_or_else(|| self.default_level());
@@ -1463,7 +1497,8 @@ impl TieringManager {
 
     /// Get tiering level for a contact based on its /16 prefix.
     pub fn level_for(&self, contact: &Contact) -> TieringLevel {
-        contact.provenance()
+        contact
+            .provenance()
             .and_then(|provenance| self.prefix_tiers.get(&provenance).copied())
             .unwrap_or_else(|| self.default_level())
     }
@@ -1503,6 +1538,10 @@ impl TieringManager {
 
         let min_required = self.min_tiers.max(2);
         if per_prefix.len() < min_required {
+            // SECURITY HARDENING: Clear prefix_tiers when we don't have enough data.
+            // This prevents stale entries from accumulating when prefix_rtt entries
+            // are evicted by LRU but prefix_tiers retains them indefinitely.
+            self.prefix_tiers.clear();
             return;
         }
 
@@ -1512,9 +1551,13 @@ impl TieringManager {
         let (centroids, assignments) = dynamic_kmeans(&samples, self.min_tiers, max_k);
 
         // Update prefix tier assignments
+        // SECURITY HARDENING: Always clear and rebuild from current prefix_rtt entries.
+        // This ensures prefix_tiers is transitively bounded by MAX_TIERING_TRACKED_PREFIXES
+        // and prevents memory leaks from stale entries that were evicted from prefix_rtt.
         self.prefix_tiers.clear();
         for ((prefix, _avg), tier_idx) in per_prefix.iter().zip(assignments.iter()) {
-            self.prefix_tiers.insert(*prefix, TieringLevel::new(*tier_idx));
+            self.prefix_tiers
+                .insert(*prefix, TieringLevel::new(*tier_idx));
         }
 
         if !centroids.is_empty() {
@@ -1625,7 +1668,7 @@ fn run_kmeans(samples: &[f32], k: usize) -> (Vec<f32>, Vec<usize>, f32) {
     }
 
     let mut sorted_assignments = assignments;
-    for idx in sorted_assignments.iter_mut() {
+    for idx in &mut sorted_assignments {
         *idx = remap[*idx];
     }
 
@@ -1644,7 +1687,7 @@ fn ensure_tier_coverage(samples: &[f32], centroids: &mut [f32], assignments: &mu
     }
 
     let mut sorted_samples: Vec<f32> = samples.to_vec();
-    sorted_samples.sort_by(|a, b| a.total_cmp(b));
+    sorted_samples.sort_by(f32::total_cmp);
 
     for (tier_idx, count) in counts.iter_mut().enumerate() {
         if *count == 0 {
@@ -1662,7 +1705,7 @@ fn ensure_tier_coverage(samples: &[f32], centroids: &mut [f32], assignments: &mu
 
 fn initialize_centroids(samples: &[f32], k: usize) -> Vec<f32> {
     let mut sorted = samples.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.sort_by(f32::total_cmp);
 
     if sorted.is_empty() {
         return vec![0.0];
@@ -1695,7 +1738,6 @@ fn nearest_center_scalar(value: f32, centers: &[f32]) -> usize {
     best_idx
 }
 
-
 /// Default Kademlia replication factor (bucket size).
 /// At 10M+ nodes: 256 buckets × 20 contacts = 5,120 routing contacts (~640 KB).
 /// Adaptive range: 10-30 based on observed churn.
@@ -1704,8 +1746,6 @@ pub const DEFAULT_K: usize = 20;
 /// Default Kademlia concurrency factor (parallel queries).
 /// Adaptive range: 2-5 based on network congestion.
 pub const DEFAULT_ALPHA: usize = 3;
-
-
 
 pub struct DhtNode<N: DhtNodeRpc> {
     cmd_tx: mpsc::Sender<Command>,
@@ -1748,25 +1788,39 @@ enum Command {
     ObserveContactFromPeer(Contact, Identity, oneshot::Sender<bool>),
     RecordRtt(Contact, Duration),
     AdjustK(bool),
-    
+
     // Queries
-    GetLookupParams(Identity, Option<TieringLevel>, oneshot::Sender<(usize, usize, Vec<Contact>)>),
+    GetLookupParams(
+        Identity,
+        Option<TieringLevel>,
+        oneshot::Sender<(usize, usize, Vec<Contact>)>,
+    ),
     GetLocal(Key, oneshot::Sender<Option<Vec<u8>>>),
-    StoreLocal(Key, Vec<u8>, Identity, ValueType, oneshot::Sender<Vec<(Key, Vec<u8>)>>),
+    StoreLocal(
+        Key,
+        Vec<u8>,
+        Identity,
+        ValueType,
+        oneshot::Sender<Vec<(Key, Vec<u8>)>>,
+    ),
     GetTelemetry(oneshot::Sender<TelemetrySnapshot>),
     GetSlowestLevel(oneshot::Sender<TieringLevel>),
     LookupContact(Identity, oneshot::Sender<Option<Contact>>),
-    
+
     // RPC Handlers
     HandleFindNode(Contact, Identity, oneshot::Sender<Vec<Contact>>),
-    HandleFindValue(Contact, Key, oneshot::Sender<(Option<Vec<u8>>, Vec<Contact>)>),
+    HandleFindValue(
+        Contact,
+        Key,
+        oneshot::Sender<(Option<Vec<u8>>, Vec<Contact>)>,
+    ),
     HandleStore(Contact, Key, Vec<u8>),
-    
+
     // Maintenance
     GetStaleBuckets(Duration, oneshot::Sender<Vec<usize>>),
     MarkBucketRefreshed(usize),
     ApplyPingResult(PendingBucketUpdate, bool),
-    
+
     Quit,
 }
 
@@ -1774,7 +1828,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     pub fn new(id: Identity, self_contact: Contact, network: N, k: usize, alpha: usize) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
         let network = Arc::new(network);
-        
+
         let actor = DhtNodeActor {
             routing: RoutingTable::new(id, k),
             store: LocalStore::new(),
@@ -1796,7 +1850,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             self_contact,
             network,
         };
-        
+
         node.spawn_periodic_bucket_refresh();
         node
     }
@@ -1820,7 +1874,12 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     /// Returns the contact if found, None otherwise.
     pub async fn lookup_contact(&self, identity: &Identity) -> Option<Contact> {
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::LookupContact(*identity, tx)).await.is_err() {
+        if self
+            .cmd_tx
+            .send(Command::LookupContact(*identity, tx))
+            .await
+            .is_err()
+        {
             return None;
         }
         rx.await.ok().flatten()
@@ -1831,11 +1890,11 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     }
 
     /// Observe a directly connected peer (bypasses PoW check).
-    /// 
+    ///
     /// Use this for peers whose identity has been verified via mTLS.
     /// Direct peers are trusted because they've proven possession of the
     /// private key during the TLS handshake.
-    /// 
+    ///
     /// SECURITY: Only call this for peers you've directly connected to via QUIC/mTLS.
     /// Do NOT use for contacts received via DHT gossip.
     pub async fn observe_direct_peer(&self, contact: Contact) {
@@ -1844,7 +1903,12 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
     pub async fn observe_contact_from_peer(&self, contact: Contact, from_peer: &Identity) -> bool {
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::ObserveContactFromPeer(contact, *from_peer, tx)).await.is_err() {
+        if self
+            .cmd_tx
+            .send(Command::ObserveContactFromPeer(contact, *from_peer, tx))
+            .await
+            .is_err()
+        {
             return false;
         }
         rx.await.unwrap_or(false)
@@ -1859,10 +1923,15 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 interval.tick().await;
 
                 let (tx, rx) = oneshot::channel();
-                if node.cmd_tx.send(Command::GetStaleBuckets(BUCKET_STALE_THRESHOLD, tx)).await.is_err() {
+                if node
+                    .cmd_tx
+                    .send(Command::GetStaleBuckets(BUCKET_STALE_THRESHOLD, tx))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
-                
+
                 let stale_buckets = match rx.await {
                     Ok(buckets) => buckets,
                     Err(_) => break,
@@ -1884,7 +1953,10 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                         debug!(bucket = bucket_idx, error = ?e, "bucket refresh lookup failed");
                     }
 
-                    let _ = node.cmd_tx.send(Command::MarkBucketRefreshed(bucket_idx)).await;
+                    let _ = node
+                        .cmd_tx
+                        .send(Command::MarkBucketRefreshed(bucket_idx))
+                        .await;
                 }
             }
         });
@@ -1892,7 +1964,12 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
     pub async fn handle_find_node_request(&self, from: &Contact, target: Identity) -> Vec<Contact> {
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::HandleFindNode(from.clone(), target, tx)).await.is_err() {
+        if self
+            .cmd_tx
+            .send(Command::HandleFindNode(from.clone(), target, tx))
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -1904,7 +1981,12 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         key: Key,
     ) -> (Option<Vec<u8>>, Vec<Contact>) {
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::HandleFindValue(from.clone(), key, tx)).await.is_err() {
+        if self
+            .cmd_tx
+            .send(Command::HandleFindValue(from.clone(), key, tx))
+            .await
+            .is_err()
+        {
             return (None, Vec::new());
         }
         rx.await.unwrap_or((None, Vec::new()))
@@ -1912,13 +1994,19 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
     pub async fn handle_store_request(&self, from: &Contact, key: Key, value: Vec<u8>) {
         // Fire and forget store request handling to avoid blocking
-        let _ = self.cmd_tx.send(Command::HandleStore(from.clone(), key, value)).await;
+        let _ = self
+            .cmd_tx
+            .send(Command::HandleStore(from.clone(), key, value))
+            .await;
     }
 
     /// Record an RTT measurement for a contact (used for tiering).
     /// This is fire-and-forget; failures are silently ignored.
     pub async fn record_rtt(&self, contact: &Contact, elapsed: Duration) {
-        let _ = self.cmd_tx.send(Command::RecordRtt(contact.clone(), elapsed)).await;
+        let _ = self
+            .cmd_tx
+            .send(Command::RecordRtt(contact.clone(), elapsed))
+            .await;
     }
 
     async fn adjust_k(&self, success: bool) {
@@ -1931,12 +2019,14 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     }
 
     /// Bootstrap into the network using a seed contact.
-    /// 
+    ///
     /// The seed contact is used to initiate the lookup even if it doesn't
     /// have a valid PoW proof. Once we successfully connect via mTLS,
     /// the peer will be added to routing via `observe_direct_peer`.
     pub async fn bootstrap(&self, seed: Contact, self_id: Identity) -> Result<Vec<Contact>> {
-        let result = self.iterative_find_node_full(self_id, None, Some(seed)).await?;
+        let result = self
+            .iterative_find_node_full(self_id, None, Some(seed))
+            .await?;
         Ok(result.closest)
     }
 
@@ -1945,7 +2035,9 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         target: Identity,
         level_filter: Option<TieringLevel>,
     ) -> Result<Vec<Contact>> {
-        let result = self.iterative_find_node_full(target, level_filter, None).await?;
+        let result = self
+            .iterative_find_node_full(target, level_filter, None)
+            .await?;
         Ok(result.closest)
     }
 
@@ -1959,11 +2051,16 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         /// Total timeout for the entire lookup operation.
         /// Prevents spending excessive time in sparse networks.
         const LOOKUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
-        
+
         let lookup_start = Instant::now();
-        
+
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::GetLookupParams(target, level_filter, tx)).await.is_err() {
+        if self
+            .cmd_tx
+            .send(Command::GetLookupParams(target, level_filter, tx))
+            .await
+            .is_err()
+        {
             return Err(anyhow!("Actor closed"));
         }
         let (k_initial, alpha, mut shortlist) = rx.await.map_err(|_| anyhow!("Actor closed"))?;
@@ -1992,8 +2089,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
         let mut best_distance = shortlist
             .first()
-            .map(|c| c.identity.xor_distance(&target))
-            .unwrap_or([0xff; 32]);
+            .map_or([0xff; 32], |c| c.identity.xor_distance(&target));
 
         loop {
             iteration += 1;
@@ -2005,7 +2101,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 );
                 break;
             }
-            
+
             // Check total lookup timeout
             if lookup_start.elapsed() > LOOKUP_TOTAL_TIMEOUT {
                 debug!(
@@ -2016,7 +2112,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 );
                 break;
             }
-            
+
             let candidates: Vec<Contact> = shortlist
                 .iter()
                 .filter(|c| !queried.contains(&c.identity) && c.identity != self.id)
@@ -2034,7 +2130,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
             // Per-query timeout to avoid slow nodes blocking the entire lookup
             const PER_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
-            
+
             let network = self.network.clone();
             let mut join_set = JoinSet::new();
             let candidates_len = candidates.len();
@@ -2042,7 +2138,9 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 let net = network.clone();
                 join_set.spawn(async move {
                     let start = Instant::now();
-                    let result = tokio::time::timeout(PER_QUERY_TIMEOUT, net.find_node(&contact, target)).await;
+                    let result =
+                        tokio::time::timeout(PER_QUERY_TIMEOUT, net.find_node(&contact, target))
+                            .await;
                     let result = match result {
                         Ok(r) => r,
                         Err(_) => Err(anyhow!("query timeout")),
@@ -2082,8 +2180,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                                 continue;
                             }
                             let has_new_addr = n.addrs.iter().any(|a| seen_addrs.insert(a.clone()));
-                            if seen.insert(n.identity) || has_new_addr
-                            {
+                            if seen.insert(n.identity) || has_new_addr {
                                 shortlist.push(n);
                             }
                         }
@@ -2144,9 +2241,13 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             );
             return;
         }
-        
+
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::StoreLocal(key, value, stored_by, value_type, tx)).await.is_ok()
+        if self
+            .cmd_tx
+            .send(Command::StoreLocal(key, value, stored_by, value_type, tx))
+            .await
+            .is_ok()
             && let Ok(spilled) = rx.await
             && !spilled.is_empty()
         {
@@ -2170,25 +2271,32 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         // Get the slowest tier for cold storage offload
         let target_level = {
             let (tx, rx) = oneshot::channel();
-            if self.cmd_tx.send(Command::GetSlowestLevel(tx)).await.is_err() {
+            if self
+                .cmd_tx
+                .send(Command::GetSlowestLevel(tx))
+                .await
+                .is_err()
+            {
                 return;
             }
             rx.await.unwrap_or(TieringLevel::new(0))
         };
-        
+
         for (key, value) in spilled {
             let mut attempt = 0;
             loop {
-                let success = self.replicate_to_level(key, value.clone(), target_level).await;
+                let success = self
+                    .replicate_to_level(key, value.clone(), target_level)
+                    .await;
                 if success {
                     break;
                 }
-                
+
                 attempt += 1;
                 if attempt >= OFFLOAD_MAX_RETRIES {
                     break;
                 }
-                
+
                 let delay_ms = OFFLOAD_BASE_DELAY_MS * (1 << (attempt - 1));
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
@@ -2204,15 +2312,18 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             Ok(c) => c,
             Err(_) => return false,
         };
-        
+
         if contacts.is_empty() {
             return false;
         }
-        
-        let k = DEFAULT_K; 
+
+        let k = DEFAULT_K;
         let mut any_success = false;
         for contact in contacts.into_iter().take(k) {
-            if self.send_store_with_result(&contact, key, value.clone()).await {
+            if self
+                .send_store_with_result(&contact, key, value.clone())
+                .await
+            {
                 any_success = true;
             }
         }
@@ -2222,25 +2333,20 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     async fn send_store_with_result(&self, contact: &Contact, key: Key, value: Vec<u8>) -> bool {
         const STORE_TIMEOUT: Duration = Duration::from_secs(5);
         let start = Instant::now();
-        let result = tokio::time::timeout(
-            STORE_TIMEOUT,
-            self.network.store(contact, key, value)
-        ).await;
-        
-        match result {
-            Ok(Ok(_)) => {
-                let elapsed = start.elapsed();
-                self.record_rtt(contact, elapsed).await;
-                self.adjust_k(true).await;
-                // Use observe_direct_peer: we just did mTLS-verified RPC with this peer
-                self.observe_direct_peer(contact.clone()).await;
-                true
-            }
-            Ok(Err(_)) | Err(_) => {
-                // RPC error or timeout
-                self.adjust_k(false).await;
-                false
-            }
+        let result =
+            tokio::time::timeout(STORE_TIMEOUT, self.network.store(contact, key, value)).await;
+
+        if let Ok(Ok(())) = result {
+            let elapsed = start.elapsed();
+            self.record_rtt(contact, elapsed).await;
+            self.adjust_k(true).await;
+            // Use observe_direct_peer: we just did mTLS-verified RPC with this peer
+            self.observe_direct_peer(contact.clone()).await;
+            true
+        } else {
+            // RPC error or timeout
+            self.adjust_k(false).await;
+            false
         }
     }
 
@@ -2255,7 +2361,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
         let target = Identity::from_bytes(key);
         let closest = self.iterative_find_node_with_level(target, None).await?;
-        let k = DEFAULT_K; 
+        let k = DEFAULT_K;
 
         // Parallelize stores for faster completion
         let mut join_set = JoinSet::new();
@@ -2314,15 +2420,17 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
         // Query contacts in parallel with early return on first success
         const FIND_VALUE_TIMEOUT: Duration = Duration::from_secs(3);
-        
+
         // Query all in parallel and return on the first successful value.
         let network = self.network.clone();
         let key_copy = *key;
         let mut join_set = JoinSet::new();
-        for contact in closest.into_iter() {
+        for contact in closest {
             let net = network.clone();
             join_set.spawn(async move {
-                let result = tokio::time::timeout(FIND_VALUE_TIMEOUT, net.find_value(&contact, key_copy)).await;
+                let result =
+                    tokio::time::timeout(FIND_VALUE_TIMEOUT, net.find_value(&contact, key_copy))
+                        .await;
 
                 match result {
                     Ok(Ok((Some(value), _))) => Some(value),
@@ -2347,7 +2455,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     pub async fn publish_address(&self, keypair: &Keypair, addresses: Vec<String>) -> Result<()> {
         let record = keypair.create_contact(addresses);
         let serialized = bincode::serialize(&record)
-            .map_err(|e| anyhow!("Failed to serialize endpoint record: {}", e))?;
+            .map_err(|e| anyhow!("Failed to serialize endpoint record: {e}"))?;
 
         let key: Key = *record.identity.as_bytes();
         self.put_at(key, serialized).await
@@ -2363,7 +2471,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         match data_opt {
             Some(data) => {
                 let record: Contact = crate::messages::deserialize_bounded(&data)
-                    .map_err(|e| anyhow!("Failed to deserialize endpoint record: {}", e))?;
+                    .map_err(|e| anyhow!("Failed to deserialize endpoint record: {e}"))?;
 
                 if !record.validate_structure() {
                     return Err(anyhow!("Endpoint record has invalid structure"));
@@ -2377,13 +2485,13 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                     let reason = match e {
                         FreshnessError::SignatureInvalid => "invalid signature".to_string(),
                         FreshnessError::ClockSkewFuture { drift_ms, .. } => {
-                            format!("timestamp {}ms in future (clock skew)", drift_ms)
+                            format!("timestamp {drift_ms}ms in future (clock skew)")
                         }
                         FreshnessError::Stale { age_ms, .. } => {
                             format!("record is {}s old (stale)", age_ms / 1000)
                         }
                     };
-                    return Err(anyhow!("Endpoint record verification failed: {}", reason));
+                    return Err(anyhow!("Endpoint record verification failed: {reason}"));
                 }
 
                 Ok(Some(record))
@@ -2397,19 +2505,16 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         keypair: &Keypair,
         new_addrs: Vec<String>,
     ) -> Result<()> {
-        debug!(
-            "republishing address after network change: {:?}",
-            new_addrs
-        );
+        debug!("republishing address after network change: {:?}", new_addrs);
 
         let record = keypair.create_contact(new_addrs);
         let serialized = bincode::serialize(&record)
-            .map_err(|e| anyhow!("Failed to serialize endpoint record: {}", e))?;
+            .map_err(|e| anyhow!("Failed to serialize endpoint record: {e}"))?;
 
         let key: Key = *record.identity.as_bytes();
         self.put_at(key, serialized).await
     }
-    
+
     pub async fn quit(&self) {
         let _ = self.cmd_tx.send(Command::Quit).await;
     }
@@ -2440,11 +2545,11 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
                     let k = self.params.current_k();
                     let alpha = self.params.current_alpha();
                     let mut closest = self.routing.closest(&target, k);
-                    
+
                     if let Some(level) = level_filter {
                         closest.retain(|c| self.tiering.level_for(c) == level);
                     }
-                    
+
                     let _ = reply.send((k, alpha, closest));
                 }
                 Command::GetLocal(key, reply) => {
@@ -2539,10 +2644,10 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
     }
 
     /// Handle a directly-connected peer (mTLS verified).
-    /// 
+    ///
     /// SECURITY: Bypasses PoW check because the peer has proven identity
     /// via mTLS certificate verification during QUIC handshake.
-    /// 
+    ///
     /// However, to prevent exploitation by attackers with many IP addresses,
     /// insertions are rate-limited per source IP. This ensures that while
     /// direct peers don't need PoW, the connection establishment cost provides
@@ -2554,7 +2659,7 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
         if !contact.identity.is_valid() {
             return;
         }
-        
+
         // SECURITY: Rate limit by source IP to prevent multi-IP attackers from
         // bypassing PoW by establishing many direct connections.
         if !self.direct_peer_limiter.allow_direct_peer(&contact) {
@@ -2565,7 +2670,7 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
             );
             return;
         }
-        
+
         // No PoW check - peer identity was verified via mTLS
         self.insert_contact_into_routing(contact);
     }
@@ -2575,7 +2680,7 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
         self.tiering.register_contact(&contact);
         let k = self.params.current_k();
         self.routing.set_k(k);
-        
+
         if let Some(update) = self.routing.update_with_pending(contact.clone()) {
             let network = self.network.clone();
             let tx = self.cmd_tx.clone();
@@ -2618,14 +2723,14 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{IdentityProof, POW_DIFFICULTY};
+    use anyhow::anyhow;
+    use ed25519_dalek::SigningKey;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
-    use anyhow::anyhow;
-    use ed25519_dalek::SigningKey;
     use tokio::sync::{Mutex, RwLock};
     use tokio::time::sleep;
-    use crate::identity::{IdentityProof, POW_DIFFICULTY};
 
     #[derive(Clone)]
     struct TestNetwork {
@@ -2655,7 +2760,11 @@ mod tests {
 
         async fn set_failure(&self, node: Identity, fail: bool) {
             let mut failures = self.failures.lock().await;
-            if fail { failures.insert(node); } else { failures.remove(&node); }
+            if fail {
+                failures.insert(node);
+            } else {
+                failures.remove(&node);
+            }
         }
 
         async fn store_calls(&self) -> Vec<(Contact, Key, usize)> {
@@ -2684,7 +2793,10 @@ mod tests {
 
     impl NetworkRegistry {
         async fn register(&self, node: &DhtNode<TestNetwork>) {
-            self.peers.write().await.insert(node.contact().identity, node.clone());
+            self.peers
+                .write()
+                .await
+                .insert(node.contact().identity, node.clone());
         }
 
         async fn get(&self, id: &Identity) -> Option<DhtNode<TestNetwork>> {
@@ -2700,19 +2812,27 @@ mod tests {
             }
             self.maybe_sleep(&to.identity).await;
             if let Some(peer) = self.registry.get(&to.identity).await {
-                Ok(peer.handle_find_node_request(&self.self_contact, target).await)
+                Ok(peer
+                    .handle_find_node_request(&self.self_contact, target)
+                    .await)
             } else {
                 Ok(Vec::new())
             }
         }
 
-        async fn find_value(&self, to: &Contact, key: Key) -> anyhow::Result<(Option<Vec<u8>>, Vec<Contact>)> {
+        async fn find_value(
+            &self,
+            to: &Contact,
+            key: Key,
+        ) -> anyhow::Result<(Option<Vec<u8>>, Vec<Contact>)> {
             if self.should_fail(&to.identity).await {
                 return Err(anyhow!("injected network failure"));
             }
             self.maybe_sleep(&to.identity).await;
             if let Some(peer) = self.registry.get(&to.identity).await {
-                Ok(peer.handle_find_value_request(&self.self_contact, key).await)
+                Ok(peer
+                    .handle_find_value_request(&self.self_contact, key)
+                    .await)
             } else {
                 Ok((None, Vec::new()))
             }
@@ -2723,9 +2843,13 @@ mod tests {
                 return Err(anyhow!("injected network failure"));
             }
             self.maybe_sleep(&to.identity).await;
-            self.stores.lock().await.push((to.clone(), key, value.len()));
+            self.stores
+                .lock()
+                .await
+                .push((to.clone(), key, value.len()));
             if let Some(peer) = self.registry.get(&to.identity).await {
-                peer.handle_store_request(&self.self_contact, key, value).await;
+                peer.handle_store_request(&self.self_contact, key, value)
+                    .await;
             }
             Ok(())
         }
@@ -2743,7 +2867,11 @@ mod tests {
             }
         }
 
-        async fn check_reachability(&self, to: &Contact, _probe_addr: &str) -> anyhow::Result<bool> {
+        async fn check_reachability(
+            &self,
+            to: &Contact,
+            _probe_addr: &str,
+        ) -> anyhow::Result<bool> {
             if self.should_fail(&to.identity).await {
                 return Err(anyhow!("injected network failure"));
             }
@@ -2834,7 +2962,11 @@ mod tests {
             results.first().map(|c| c.identity),
             Some(peer_two.contact().identity)
         );
-        assert!(results.iter().any(|c| c.identity == peer_one.contact().identity));
+        assert!(
+            results
+                .iter()
+                .any(|c| c.identity == peer_one.contact().identity)
+        );
     }
 
     #[tokio::test]
@@ -2879,17 +3011,18 @@ mod tests {
             let peer = make_contact(peer_idx + 2);
             let value = vec![peer_idx as u8; 900 * 1024];
             let key = *hash(&value).as_bytes();
-            node.node
-                .handle_store_request(&peer, key, value)
-                .await;
+            node.node.handle_store_request(&peer, key, value).await;
         }
 
         let snapshot = node.node.telemetry_snapshot().await;
         assert!(snapshot.pressure > 0.5, "pressure: {}", snapshot.pressure);
-        
+
         let calls = node.network.store_calls().await;
-        assert!(!calls.is_empty() || snapshot.stored_keys < 10, 
-            "should have offloaded to network or evicted, stored_keys={}", snapshot.stored_keys);
+        assert!(
+            !calls.is_empty() || snapshot.stored_keys < 10,
+            "should have offloaded to network or evicted, stored_keys={}",
+            snapshot.stored_keys
+        );
     }
 
     #[tokio::test]
@@ -2927,7 +3060,10 @@ mod tests {
             .expect("lookup succeeds");
 
         // Verify routing table has all 3 peers (tiering is for optimization, not routing)
-        let lookup_result = main.node.handle_find_node_request(&main.contact(), target).await;
+        let lookup_result = main
+            .node
+            .handle_find_node_request(&main.contact(), target)
+            .await;
         assert!(
             lookup_result.len() >= 3,
             "should have all 3 peers in routing table, got {}",
@@ -3323,7 +3459,7 @@ mod tests {
             let (idx, node) = joined.expect("test node join");
             nodes[idx] = Some(node);
         }
-        let nodes: Vec<TestNode> = nodes.into_iter().map(|n| n.expect("test node")) .collect();
+        let nodes: Vec<TestNode> = nodes.into_iter().map(|n| n.expect("test node")).collect();
 
         for i in 0..nodes.len() {
             for j in 0..nodes.len() {
@@ -3371,7 +3507,10 @@ mod tests {
 
         // tier_counts now counts /16 prefixes, not individual peers
         // The routing table should still track peers, verify via a lookup
-        let lookup_result = target.node.handle_find_node_request(&target.contact(), make_identity(0xFF00)).await;
+        let lookup_result = target
+            .node
+            .handle_find_node_request(&target.contact(), make_identity(0xFF00))
+            .await;
         assert!(
             !lookup_result.is_empty(),
             "Routing table should accept diverse peers, got {} peers in lookup",
@@ -3406,7 +3545,10 @@ mod tests {
         }
 
         // Verify routing table contains nodes (eclipse resistance is about routing, not tiering)
-        let lookup_result = victim.node.handle_find_node_request(&victim.contact(), make_identity(0xFF00)).await;
+        let lookup_result = victim
+            .node
+            .handle_find_node_request(&victim.contact(), make_identity(0xFF00))
+            .await;
         assert!(
             lookup_result.len() >= 5,
             "Should track at least some nodes, got {} in lookup",
@@ -3424,9 +3566,7 @@ mod tests {
         for i in 0..5 {
             // Long-lived nodes with diverse /16 prefixes
             let long_lived_node = TestNode::new(registry.clone(), 0x1000 + i * 0x100, 20, 3).await;
-            node.node
-                .observe_contact(long_lived_node.contact())
-                .await;
+            node.node.observe_contact(long_lived_node.contact()).await;
             long_lived.push(long_lived_node);
         }
 
@@ -3437,14 +3577,16 @@ mod tests {
         }
 
         // Verify via routing table lookup (bucket replacement is about routing, not tiering)
-        let lookup_result = node.node.handle_find_node_request(&node.contact(), make_identity(0xFF00)).await;
+        let lookup_result = node
+            .node
+            .handle_find_node_request(&node.contact(), make_identity(0xFF00))
+            .await;
         assert!(
             lookup_result.len() >= 5,
             "Should maintain at least the original nodes, got {} in lookup",
             lookup_result.len()
         );
     }
-
 
     #[test]
     fn content_key_is_deterministic() {
@@ -3522,7 +3664,7 @@ mod tests {
     async fn dht_identity_accessor() {
         let registry = Arc::new(NetworkRegistry::default());
         let node = TestNode::new(registry.clone(), 0x42, 20, 3).await;
-        
+
         let expected_id = make_identity(0x42);
         assert_eq!(node.node.identity(), expected_id);
     }
@@ -3568,18 +3710,28 @@ mod tests {
         // Sanity-check the lookup ordering before introducing latency.
         // With `alpha >= 2`, we rely on the first two contacts being fast+dummy so that
         // iterative_find_node does not block on the slow peer.
-        let closest_pre = tokio::time::timeout(Duration::from_secs(1), main.node.iterative_find_node(target))
-            .await
-            .expect("iterative_find_node should complete quickly")
-            .expect("iterative_find_node should succeed");
+        let closest_pre = tokio::time::timeout(
+            Duration::from_secs(1),
+            main.node.iterative_find_node(target),
+        )
+        .await
+        .expect("iterative_find_node should complete quickly")
+        .expect("iterative_find_node should succeed");
         let closest_without_self: Vec<Contact> = closest_pre
             .into_iter()
             .filter(|c| c.identity != main.contact().identity)
             .collect();
-        assert!(closest_without_self.len() >= 3, "expected at least 3 non-self contacts");
+        assert!(
+            closest_without_self.len() >= 3,
+            "expected at least 3 non-self contacts"
+        );
         assert_eq!(closest_without_self[0].identity, fast.contact().identity);
         assert_eq!(closest_without_self[1].identity, dummy.contact().identity);
-        assert!(closest_without_self.iter().any(|c| c.identity == slow.contact().identity));
+        assert!(
+            closest_without_self
+                .iter()
+                .any(|c| c.identity == slow.contact().identity)
+        );
 
         // Ensure the slow peer will not respond within FIND_VALUE_TIMEOUT.
         main.network
@@ -3696,7 +3848,7 @@ mod tests {
     #[test]
     fn routing_insertion_limiter_uses_lru_eviction() {
         let mut limiter = RoutingInsertionLimiter::new();
-        
+
         for i in 0..MAX_ROUTING_INSERTION_TRACKED_PEERS {
             let mut bytes = [0u8; 32];
             bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
@@ -3705,7 +3857,10 @@ mod tests {
         }
 
         let new_peer = Identity::from_bytes([0xFF; 32]);
-        assert!(limiter.allow_insertion(&new_peer), "new peer should be allowed");
+        assert!(
+            limiter.allow_insertion(&new_peer),
+            "new peer should be allowed"
+        );
 
         let remaining = limiter.remaining_tokens(&new_peer);
         assert!(
@@ -3719,11 +3874,11 @@ mod tests {
         // SECURITY TEST: Verify that the DirectPeerIpLimiter enforces per-IP rate limiting
         // to prevent multi-IP attackers from bypassing PoW via direct connections.
         let mut limiter = DirectPeerIpLimiter::new();
-        
+
         // Create a contact with a known IP address using the correct API
         let keypair = crate::identity::Keypair::generate();
         let contact = Contact::single(keypair.identity(), "192.168.1.100:8080");
-        
+
         // Should allow up to DIRECT_PEER_PER_IP_LIMIT insertions
         for i in 0..DIRECT_PEER_PER_IP_LIMIT {
             assert!(
@@ -3732,31 +3887,34 @@ mod tests {
                 i
             );
         }
-        
+
         // Next insertion should be rate-limited
         assert!(
             !limiter.allow_direct_peer(&contact),
             "insertion beyond limit should be rejected"
         );
     }
-    
+
     #[test]
     fn direct_peer_ip_limiter_independent_per_ip() {
         // SECURITY TEST: Verify that different IPs have independent rate limits
         let mut limiter = DirectPeerIpLimiter::new();
-        
+
         let keypair1 = crate::identity::Keypair::generate();
         let contact1 = Contact::single(keypair1.identity(), "192.168.1.100:8080");
-        
+
         let keypair2 = crate::identity::Keypair::generate();
         let contact2 = Contact::single(keypair2.identity(), "192.168.1.200:8080");
-        
+
         // Exhaust limit for first IP
         for _ in 0..DIRECT_PEER_PER_IP_LIMIT {
             limiter.allow_direct_peer(&contact1);
         }
-        assert!(!limiter.allow_direct_peer(&contact1), "first IP should be limited");
-        
+        assert!(
+            !limiter.allow_direct_peer(&contact1),
+            "first IP should be limited"
+        );
+
         // Second IP should still be allowed
         assert!(
             limiter.allow_direct_peer(&contact2),
@@ -3774,7 +3932,7 @@ mod tests {
         let contact1 = make_test_contact(0x10);
         let contact2 = make_test_contact(0x20);
         let contact3 = make_test_contact(0x30);
-        
+
         table.update(contact1.clone());
         table.update(contact2.clone());
         table.update(contact3.clone());
@@ -3782,10 +3940,10 @@ mod tests {
         // Use one of the contacts as the target to test ordering
         let target = contact2.identity;
         let closest = table.closest(&target, 3);
-        
+
         // Verify we get all 3 contacts back
         assert_eq!(closest.len(), 3);
-        
+
         // Verify they're ordered by XOR distance to target
         for i in 0..closest.len() - 1 {
             let dist_i = closest[i].identity.xor_distance(&target);
@@ -3795,7 +3953,7 @@ mod tests {
                 "contacts should be ordered by distance to target"
             );
         }
-        
+
         // The first result should be the target itself (distance 0)
         assert_eq!(closest[0].identity, target);
     }
@@ -3809,14 +3967,14 @@ mod tests {
         let contact1 = make_test_contact(0x80);
         let contact2 = make_test_contact(0x81);
         let contact3 = make_test_contact(0x82);
-        
+
         table.update(contact1.clone());
         table.update(contact2.clone());
         table.update(contact3.clone());
 
         // Request up to 10, but should only get what's in the table
         let closest = table.closest(&contact1.identity, 10);
-        
+
         // The number of contacts depends on bucket distribution
         // With k=2, each bucket can hold 2 contacts
         // Just verify we got some results and they're valid
@@ -3832,7 +3990,7 @@ mod tests {
         let contact1 = make_test_contact(0x80);
         let contact2 = make_test_contact(0x81);
         let contact3 = make_test_contact(0x82);
-        
+
         table.update(contact1.clone());
         table.update(contact2.clone());
         table.update(contact3.clone());

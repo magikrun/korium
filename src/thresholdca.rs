@@ -670,9 +670,8 @@ impl DkgCoordinator {
         }
 
         // Execute Round 2
-        let (secret_package, round2_packages) =
-            frost::keys::dkg::part2(secret.0, &round1_packages)
-                .map_err(|e| ThresholdCaError::DkgFailed(e.to_string()))?;
+        let (secret_package, round2_packages) = frost::keys::dkg::part2(secret.0, &round1_packages)
+            .map_err(|e| ThresholdCaError::DkgFailed(e.to_string()))?;
 
         // Create messages for each recipient
         let mut messages = Vec::new();
@@ -798,8 +797,7 @@ pub fn generate_signing_commitment(
 ) -> Result<(SigningNonce, Vec<u8>), ThresholdCaError> {
     let mut rng = rand::rngs::OsRng;
 
-    let (nonces, commitments) =
-        frost::round1::commit(signer.key_package.signing_share(), &mut rng);
+    let (nonces, commitments) = frost::round1::commit(signer.key_package.signing_share(), &mut rng);
 
     let commitment_bytes = commitments
         .serialize()
@@ -990,7 +988,7 @@ pub struct CertificateParamsData {
 /// after collecting threshold signatures.
 ///
 /// # Returns
-/// 
+///
 /// A `CertificateSigningRequest` containing:
 /// - `tbs_der`: The DER-encoded TBSCertificate to be signed
 /// - `params`: Certificate parameters for final assembly
@@ -1017,8 +1015,9 @@ pub fn generate_csr(
 
     // Generate random serial number (required for X.509)
     let mut serial_number = [0u8; 20];
-    getrandom::getrandom(&mut serial_number)
-        .map_err(|e| ThresholdCaError::CertificateError(format!("failed to generate serial: {e}")))?;
+    getrandom::getrandom(&mut serial_number).map_err(|e| {
+        ThresholdCaError::CertificateError(format!("failed to generate serial: {e}"))
+    })?;
     // Ensure positive (set high bit to 0)
     serial_number[0] &= 0x7F;
 
@@ -1077,55 +1076,55 @@ fn build_tbs_certificate_der(
 ) -> Result<Vec<u8>, ThresholdCaError> {
     // We'll build the DER structure manually to ensure correctness.
     // This is more reliable than depending on rcgen's internal serialization.
-    
+
     let mut tbs = Vec::with_capacity(512);
-    
+
     // Build inner content first, then wrap in SEQUENCE
     let mut content = Vec::with_capacity(400);
-    
+
     // Version [0] EXPLICIT INTEGER (v3 = 2)
     // Tag: A0 (context-specific, constructed, tag 0)
     // Content: INTEGER 02 01 02
     content.extend_from_slice(&[0xA0, 0x03, 0x02, 0x01, 0x02]);
-    
+
     // SerialNumber INTEGER
     let serial_der = encode_integer(&params.serial_number);
     content.extend_from_slice(&serial_der);
-    
+
     // Signature AlgorithmIdentifier (Ed25519 = 1.3.101.112)
     // SEQUENCE { OID 1.3.101.112 }
     content.extend_from_slice(&[
-        0x30, 0x05,             // SEQUENCE, length 5
-        0x06, 0x03,             // OID, length 3
-        0x2B, 0x65, 0x70,       // 1.3.101.112 (Ed25519)
+        0x30, 0x05, // SEQUENCE, length 5
+        0x06, 0x03, // OID, length 3
+        0x2B, 0x65, 0x70, // 1.3.101.112 (Ed25519)
     ]);
-    
+
     // Issuer Name (CN=Korium Threshold CA)
     let issuer = encode_rdn("Korium Threshold CA");
     content.extend_from_slice(&issuer);
-    
+
     // Validity SEQUENCE { notBefore, notAfter }
     let validity = encode_validity(params.not_before, params.not_after)?;
     content.extend_from_slice(&validity);
-    
+
     // Subject Name (CN=<common_name>)
     let subject = encode_rdn(&params.common_name);
     content.extend_from_slice(&subject);
-    
+
     // SubjectPublicKeyInfo SEQUENCE { algorithm, publicKey }
     let spki = encode_ed25519_spki(subject_public_key);
     content.extend_from_slice(&spki);
-    
+
     // Extensions [3] EXPLICIT SEQUENCE
     let extensions = encode_extensions(&params.spiffe_uri)?;
     content.extend_from_slice(&extensions);
-    
+
     // Wrap in SEQUENCE
     let content_len = content.len();
     tbs.push(0x30); // SEQUENCE tag
     encode_length(content_len, &mut tbs);
     tbs.extend_from_slice(&content);
-    
+
     Ok(tbs)
 }
 
@@ -1133,23 +1132,23 @@ fn build_tbs_certificate_der(
 fn encode_integer(bytes: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(bytes.len() + 4);
     result.push(0x02); // INTEGER tag
-    
+
     // Skip leading zeros but keep at least one byte
     let mut start = 0;
     while start < bytes.len() - 1 && bytes[start] == 0 {
         start += 1;
     }
-    
+
     // If high bit is set, prepend a 0x00
     let needs_padding = bytes[start] & 0x80 != 0;
     let content_len = bytes.len() - start + if needs_padding { 1 } else { 0 };
-    
+
     encode_length(content_len, &mut result);
     if needs_padding {
         result.push(0x00);
     }
     result.extend_from_slice(&bytes[start..]);
-    
+
     result
 }
 
@@ -1170,7 +1169,7 @@ fn encode_length(len: usize, out: &mut Vec<u8>) {
 /// Encode a relative distinguished name (single CN attribute).
 fn encode_rdn(common_name: &str) -> Vec<u8> {
     let cn_bytes = common_name.as_bytes();
-    
+
     // AttributeTypeAndValue: SEQUENCE { OID, UTF8String }
     // OID for CN = 2.5.4.3 = 55 04 03
     let mut atv = Vec::new();
@@ -1181,19 +1180,19 @@ fn encode_rdn(common_name: &str) -> Vec<u8> {
     atv.push(0x0C); // UTF8String
     encode_length(cn_bytes.len(), &mut atv);
     atv.extend_from_slice(cn_bytes);
-    
+
     // RDN: SET { AttributeTypeAndValue }
     let mut rdn = Vec::new();
     rdn.push(0x31); // SET
     encode_length(atv.len(), &mut rdn);
     rdn.extend_from_slice(&atv);
-    
+
     // Name: SEQUENCE { RDN }
     let mut name = Vec::new();
     name.push(0x30); // SEQUENCE
     encode_length(rdn.len(), &mut name);
     name.extend_from_slice(&rdn);
-    
+
     name
 }
 
@@ -1201,32 +1200,32 @@ fn encode_rdn(common_name: &str) -> Vec<u8> {
 fn encode_validity(not_before: u64, not_after: u64) -> Result<Vec<u8>, ThresholdCaError> {
     let before_str = unix_to_generalized_time(not_before)?;
     let after_str = unix_to_generalized_time(not_after)?;
-    
+
     let mut content = Vec::new();
-    
+
     // notBefore GeneralizedTime
     content.push(0x18); // GeneralizedTime tag
     encode_length(before_str.len(), &mut content);
     content.extend_from_slice(before_str.as_bytes());
-    
+
     // notAfter GeneralizedTime
     content.push(0x18); // GeneralizedTime tag
     encode_length(after_str.len(), &mut content);
     content.extend_from_slice(after_str.as_bytes());
-    
+
     // Wrap in SEQUENCE
     let mut validity = Vec::new();
     validity.push(0x30); // SEQUENCE
     encode_length(content.len(), &mut validity);
     validity.extend_from_slice(&content);
-    
+
     Ok(validity)
 }
 
 /// Convert Unix timestamp to GeneralizedTime format (YYYYMMDDHHMMSSZ).
 fn unix_to_generalized_time(timestamp: u64) -> Result<String, ThresholdCaError> {
     use std::time::{Duration, UNIX_EPOCH};
-    
+
     let time = UNIX_EPOCH + Duration::from_secs(timestamp);
     let datetime: chrono::DateTime<chrono::Utc> = time.into();
     Ok(datetime.format("%Y%m%d%H%M%SZ").to_string())
@@ -1239,29 +1238,29 @@ fn encode_ed25519_spki(public_key: &[u8; 32]) -> Vec<u8> {
     //   subjectPublicKey BIT STRING
     // }
     // AlgorithmIdentifier for Ed25519: SEQUENCE { OID 1.3.101.112 }
-    
+
     let mut content = Vec::new();
-    
+
     // AlgorithmIdentifier
     content.extend_from_slice(&[
-        0x30, 0x05,             // SEQUENCE, length 5
-        0x06, 0x03,             // OID, length 3
-        0x2B, 0x65, 0x70,       // 1.3.101.112 (Ed25519)
+        0x30, 0x05, // SEQUENCE, length 5
+        0x06, 0x03, // OID, length 3
+        0x2B, 0x65, 0x70, // 1.3.101.112 (Ed25519)
     ]);
-    
+
     // BIT STRING (public key)
     // BIT STRING has a leading byte for unused bits (0 in our case)
-    content.push(0x03);         // BIT STRING tag
-    content.push(0x21);         // length 33 (1 + 32)
-    content.push(0x00);         // 0 unused bits
+    content.push(0x03); // BIT STRING tag
+    content.push(0x21); // length 33 (1 + 32)
+    content.push(0x00); // 0 unused bits
     content.extend_from_slice(public_key);
-    
+
     // Wrap in SEQUENCE
     let mut spki = Vec::new();
     spki.push(0x30); // SEQUENCE
     encode_length(content.len(), &mut spki);
     spki.extend_from_slice(&content);
-    
+
     spki
 }
 
@@ -1270,26 +1269,26 @@ fn encode_extensions(spiffe_uri: &str) -> Result<Vec<u8>, ThresholdCaError> {
     // Build SAN extension
     // Extension ::= SEQUENCE { extnID, critical, extnValue }
     // SAN OID = 2.5.29.17
-    
+
     // GeneralName for URI
     let uri_bytes = spiffe_uri.as_bytes();
     let mut general_name = Vec::new();
     general_name.push(0x86); // Context-specific tag 6 (URI)
     encode_length(uri_bytes.len(), &mut general_name);
     general_name.extend_from_slice(uri_bytes);
-    
+
     // GeneralNames SEQUENCE
     let mut general_names = Vec::new();
     general_names.push(0x30); // SEQUENCE
     encode_length(general_name.len(), &mut general_names);
     general_names.extend_from_slice(&general_name);
-    
+
     // extnValue OCTET STRING
     let mut extn_value = Vec::new();
     extn_value.push(0x04); // OCTET STRING
     encode_length(general_names.len(), &mut extn_value);
     extn_value.extend_from_slice(&general_names);
-    
+
     // Extension SEQUENCE { OID, BOOLEAN (critical), OCTET STRING }
     let mut extension = Vec::new();
     extension.push(0x30); // SEQUENCE
@@ -1298,19 +1297,19 @@ fn encode_extensions(spiffe_uri: &str) -> Result<Vec<u8>, ThresholdCaError> {
     extension.extend_from_slice(&[0x06, 0x03, 0x55, 0x1D, 0x11]); // OID 2.5.29.17 (SAN)
     // Note: critical is optional and defaults to FALSE, so we omit it
     extension.extend_from_slice(&extn_value);
-    
+
     // Extensions SEQUENCE
     let mut extensions = Vec::new();
     extensions.push(0x30); // SEQUENCE
     encode_length(extension.len(), &mut extensions);
     extensions.extend_from_slice(&extension);
-    
+
     // [3] EXPLICIT wrapper
     let mut explicit = Vec::new();
     explicit.push(0xA3); // Context-specific, constructed, tag 3
     encode_length(extensions.len(), &mut explicit);
     explicit.extend_from_slice(&extensions);
-    
+
     Ok(explicit)
 }
 
@@ -1330,31 +1329,31 @@ pub fn assemble_certificate(tbs_der: &[u8], signature: &[u8]) -> Result<Vec<u8>,
     //   signatureAlgorithm   AlgorithmIdentifier,
     //   signature            BIT STRING
     // }
-    
+
     let mut content = Vec::with_capacity(tbs_der.len() + signature.len() + 20);
-    
+
     // TBSCertificate (already DER-encoded)
     content.extend_from_slice(tbs_der);
-    
+
     // SignatureAlgorithm (Ed25519)
     content.extend_from_slice(&[
-        0x30, 0x05,             // SEQUENCE, length 5
-        0x06, 0x03,             // OID, length 3
-        0x2B, 0x65, 0x70,       // 1.3.101.112 (Ed25519)
+        0x30, 0x05, // SEQUENCE, length 5
+        0x06, 0x03, // OID, length 3
+        0x2B, 0x65, 0x70, // 1.3.101.112 (Ed25519)
     ]);
-    
+
     // Signature BIT STRING
-    content.push(0x03);         // BIT STRING tag
+    content.push(0x03); // BIT STRING tag
     encode_length(signature.len() + 1, &mut content);
-    content.push(0x00);         // 0 unused bits
+    content.push(0x00); // 0 unused bits
     content.extend_from_slice(signature);
-    
+
     // Wrap in SEQUENCE
     let mut cert = Vec::new();
     cert.push(0x30); // SEQUENCE
     encode_length(content.len(), &mut cert);
     cert.extend_from_slice(&content);
-    
+
     Ok(cert)
 }
 
@@ -1370,7 +1369,10 @@ pub fn verify_tbs_signature(
     let frost_sig = frost::Signature::deserialize(signature)
         .map_err(|e| ThresholdCaError::Serialization(e.to_string()))?;
 
-    Ok(pubkey_package.verifying_key().verify(tbs, &frost_sig).is_ok())
+    Ok(pubkey_package
+        .verifying_key()
+        .verify(tbs, &frost_sig)
+        .is_ok())
 }
 
 // ============================================================================
@@ -1559,7 +1561,10 @@ mod tests {
         let deserialized = SignerState::deserialize(&serialized).unwrap();
 
         // Verify CA public key matches
-        assert_eq!(state.ca_public_key_bytes(), deserialized.ca_public_key_bytes());
+        assert_eq!(
+            state.ca_public_key_bytes(),
+            deserialized.ca_public_key_bytes()
+        );
     }
 
     #[test]
@@ -1620,9 +1625,18 @@ mod tests {
 
         // Verify TBS is embedded at the start of the certificate content
         // Skip the outer SEQUENCE header to find TBS
-        let tbs_offset = if cert[1] < 0x80 { 2 } else if cert[1] == 0x81 { 3 } else { 4 };
-        assert_eq!(&cert[tbs_offset..tbs_offset + 10], &csr.tbs_der[..10],
-            "TBS should be at start of certificate content");
+        let tbs_offset = if cert[1] < 0x80 {
+            2
+        } else if cert[1] == 0x81 {
+            3
+        } else {
+            4
+        };
+        assert_eq!(
+            &cert[tbs_offset..tbs_offset + 10],
+            &csr.tbs_der[..10],
+            "TBS should be at start of certificate content"
+        );
 
         // Certificate should be longer than TBS (adds signature algorithm + signature)
         assert!(cert.len() > csr.tbs_der.len() + 64);

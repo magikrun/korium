@@ -1,6 +1,6 @@
 [package]
 name = "korium"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "Batteries-included adaptive networking fabric"
 license = "MIT"
@@ -39,6 +39,7 @@ lru = "0.12"
 bincode = "1.3"
 getrandom = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chacha20poly1305 = "0.10"
 
 # Threshold CA (FROST signatures)
 frost-ed25519 = { version = "2.2", optional = true }

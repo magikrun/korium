@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::time::{self, Duration};
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 use korium::Node;
 
@@ -19,19 +19,21 @@ impl FromStr for BootstrapPeer {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let (addr_part, id_part) = s.rsplit_once('/')
+        let (addr_part, id_part) = s
+            .rsplit_once('/')
             .context("bootstrap peer must include Identity (format: IP:PORT/IDENTITY)")?;
-        
-        let addr: SocketAddr = addr_part.parse()
-            .context("invalid socket address")?;
-        
-        let id_bytes = hex::decode(id_part)
-            .context("invalid hex Identity")?;
+
+        let addr: SocketAddr = addr_part.parse().context("invalid socket address")?;
+
+        let id_bytes = hex::decode(id_part).context("invalid hex Identity")?;
         if id_bytes.len() != 32 {
             anyhow::bail!("Identity must be 64 hex characters (32 bytes)");
         }
-        
-        Ok(BootstrapPeer { addr, identity: id_part.to_string() })
+
+        Ok(BootstrapPeer {
+            addr,
+            identity: id_part.to_string(),
+        })
     }
 }
 
@@ -53,8 +55,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     fmt()
         .with_env_filter(filter)
@@ -82,7 +83,7 @@ async fn main() -> Result<()> {
 
     let telemetry_interval = args.telemetry_interval;
     let mut interval = time::interval(Duration::from_secs(telemetry_interval));
-    
+
     // Graceful shutdown on Ctrl+C
     loop {
         tokio::select! {
@@ -104,6 +105,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }

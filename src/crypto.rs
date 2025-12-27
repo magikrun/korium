@@ -113,7 +113,7 @@ pub struct SpiffeConfig {
     /// Required field. The trust domain identifies the administrative boundary.
     /// SPIFFE IDs from different trust domains are considered distinct.
     pub trust_domain: String,
-    
+
     /// Optional workload path suffix (e.g., "relay", "validator", "payment-svc").
     ///
     /// If provided, appended to the SPIFFE ID:
@@ -130,7 +130,7 @@ impl SpiffeConfig {
             workload_path: None,
         }
     }
-    
+
     /// Set the workload path suffix.
     pub fn with_workload_path(mut self, path: impl Into<String>) -> Self {
         self.workload_path = Some(path.into());
@@ -143,15 +143,15 @@ impl SpiffeConfig {
 // ============================================================================
 
 /// Sign data with domain separation.
-/// 
+///
 /// Prepends the domain prefix to the data before signing, preventing
 /// cross-protocol signature replay attacks.
-/// 
+///
 /// # Arguments
 /// * `keypair` - The signing keypair
 /// * `domain` - Domain separation prefix (e.g., `GOSSIPSUB_SIGNATURE_DOMAIN`)
 /// * `data` - The data to sign
-/// 
+///
 /// # Returns
 /// 64-byte Ed25519 signature as a Vec<u8>
 pub fn sign_with_domain(keypair: &Keypair, domain: &[u8], data: &[u8]) -> Vec<u8> {
@@ -162,15 +162,15 @@ pub fn sign_with_domain(keypair: &Keypair, domain: &[u8], data: &[u8]) -> Vec<u8
 }
 
 /// Verify a signature with domain separation.
-/// 
+///
 /// Reconstructs the prefixed data and verifies the Ed25519 signature.
-/// 
+///
 /// # Arguments
 /// * `identity` - The claimed signer's identity (public key)
 /// * `domain` - Domain separation prefix (must match what was used during signing)
 /// * `data` - The original data that was signed
 /// * `signature` - The 64-byte Ed25519 signature
-/// 
+///
 /// # Returns
 /// `Ok(())` if signature is valid, `Err(SignatureError)` otherwise
 pub fn verify_with_domain(
@@ -278,62 +278,55 @@ where
     let secret_key = keypair.secret_key_bytes();
     let public_key = keypair.public_key_bytes();
     let identity = keypair.identity();
-    
+
     const ED25519_OID: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
     const PKCS8_VERSION: [u8; 3] = [0x02, 0x01, 0x00];
-    
+
     let mut pkcs8 = Vec::with_capacity(48);
-    pkcs8.extend_from_slice(&[
-        0x30, 0x2e,    ]);
-    pkcs8.extend_from_slice(&PKCS8_VERSION);    pkcs8.extend_from_slice(&[
-        0x30, 0x05,    ]);
+    pkcs8.extend_from_slice(&[0x30, 0x2e]);
+    pkcs8.extend_from_slice(&PKCS8_VERSION);
+    pkcs8.extend_from_slice(&[0x30, 0x05]);
     pkcs8.extend_from_slice(&ED25519_OID);
-    pkcs8.extend_from_slice(&[
-        0x04, 0x22,        0x04, 0x20,    ]);
+    pkcs8.extend_from_slice(&[0x04, 0x22, 0x04, 0x20]);
     pkcs8.extend_from_slice(&secret_key);
-    
+
     let pkcs8_der = PrivatePkcs8KeyDer::from(pkcs8.clone());
     let key_pair = rcgen::KeyPair::try_from(&pkcs8_der)
         .context("failed to create Ed25519 key pair for certificate")?;
-    
+
     // Build Subject Alternative Names
     let identity_hex = hex::encode(public_key);
     let mut subject_alt_names: Vec<rcgen::SanType> = vec![
         // DNS SAN for SNI compatibility (identity encoded as two 32-char labels)
         rcgen::SanType::DnsName(
-            rcgen::Ia5String::try_from(format!(
-                "{}.{}",
-                &identity_hex[..32],
-                &identity_hex[32..]
-            ))
-            .context("failed to create DNS SAN")?,
+            rcgen::Ia5String::try_from(format!("{}.{}", &identity_hex[..32], &identity_hex[32..]))
+                .context("failed to create DNS SAN")?,
         ),
     ];
-    
+
     // Add SPIFFE URI SAN if configured
     if let Some(make_spiffe_id) = spiffe_id_fn {
         let spiffe_id = make_spiffe_id(&identity);
         subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id)
-                .context("failed to create SPIFFE URI SAN")?,
+            rcgen::Ia5String::try_from(spiffe_id).context("failed to create SPIFFE URI SAN")?,
         ));
     }
-    
+
     let mut params = rcgen::CertificateParams::default();
     params.subject_alt_names = subject_alt_names;
-    
+
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String(identity_hex),
     );
-    
+
     let cert = params
         .self_signed(&key_pair)
         .context("failed to generate self-signed Ed25519 certificate")?;
-    
+
     let key = PrivateKeyDer::Pkcs8(pkcs8.into());
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    
+
     Ok((vec![cert_der], key))
 }
 
@@ -352,9 +345,9 @@ pub fn create_server_config(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .context("failed to create QUIC server config")?,
     ));
-    
+
     server_config.migration(true);
-    
+
     let transport_config = Arc::get_mut(&mut server_config.transport)
         .expect("transport config should be exclusively owned immediately after creation");
     transport_config.max_idle_timeout(Some(
@@ -393,12 +386,12 @@ pub fn create_client_config(
 
 pub fn extract_public_key_from_cert(cert_der: &[u8]) -> Option<[u8; 32]> {
     use x509_parser::prelude::*;
-    
+
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
-    
+
     let spki = cert.public_key();
     let key_bytes = &spki.subject_public_key.data;
-    
+
     if key_bytes.len() == 32 {
         let mut key = [0u8; 32];
         key.copy_from_slice(key_bytes);
@@ -435,18 +428,17 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        let public_key = extract_public_key_from_cert(end_entity.as_ref())
-            .ok_or(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::BadEncoding,
-            ))?;
-        
+        let public_key = extract_public_key_from_cert(end_entity.as_ref()).ok_or(
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding),
+        )?;
+
         let identity = Identity::from_bytes(public_key);
         if !identity.is_valid() {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
-        
+
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
@@ -535,14 +527,14 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
             }
         };
 
-        let expected_identity = parse_identity_from_sni(expected_identity_sni).ok_or_else(|| {
-            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-        })?;
+        let expected_identity =
+            parse_identity_from_sni(expected_identity_sni).ok_or_else(|| {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+            })?;
 
-        let public_key = extract_public_key_from_cert(end_entity.as_ref())
-            .ok_or(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::BadEncoding,
-            ))?;
+        let public_key = extract_public_key_from_cert(end_entity.as_ref()).ok_or(
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding),
+        )?;
 
         let actual_identity = Identity::from_bytes(public_key);
         if actual_identity != expected_identity {
@@ -598,14 +590,14 @@ mod tests {
         for _ in 0..50 {
             let keypair = Keypair::generate();
             let identity = keypair.identity();
-            
-            let (certs, _key) = generate_ed25519_cert(&keypair)
-                .expect("cert generation must succeed");
-            
+
+            let (certs, _key) =
+                generate_ed25519_cert(&keypair).expect("cert generation must succeed");
+
             let cert_der = certs[0].as_ref();
-            let extracted_pk = extract_public_key_from_cert(cert_der)
-                .expect("public key extraction must succeed");
-            
+            let extracted_pk =
+                extract_public_key_from_cert(cert_der).expect("public key extraction must succeed");
+
             assert_eq!(
                 extracted_pk,
                 *identity.as_bytes(),
@@ -620,9 +612,10 @@ mod tests {
             let keypair = Keypair::generate();
             let identity = keypair.identity();
             let public_key = keypair.public_key_bytes();
-            
+
             assert_eq!(
-                *identity.as_bytes(), public_key,
+                *identity.as_bytes(),
+                public_key,
                 "P3 violation: Identity does not match public key"
             );
         }
@@ -633,12 +626,13 @@ mod tests {
         for _ in 0..50 {
             let keypair1 = Keypair::generate();
             let keypair2 = Keypair::generate();
-            
+
             let identity1 = keypair1.identity();
             let public_key2 = keypair2.public_key_bytes();
-            
+
             assert_ne!(
-                *identity1.as_bytes(), public_key2,
+                *identity1.as_bytes(),
+                public_key2,
                 "P3 violation: Identity incorrectly matched wrong public key"
             );
         }
@@ -649,15 +643,15 @@ mod tests {
         for _ in 0..50 {
             let keypair = Keypair::generate();
             let identity = keypair.identity();
-            
-            let (certs, _) = generate_ed25519_cert(&keypair)
-                .expect("cert generation must succeed");
-            
+
+            let (certs, _) = generate_ed25519_cert(&keypair).expect("cert generation must succeed");
+
             let cert_pk = extract_public_key_from_cert(certs[0].as_ref())
                 .expect("pk extraction must succeed");
-            
+
             assert_eq!(
-                *identity.as_bytes(), cert_pk,
+                *identity.as_bytes(),
+                cert_pk,
                 "P4 violation: Identity not bound to keypair via certificate"
             );
         }
@@ -666,20 +660,18 @@ mod tests {
     #[test]
     fn different_keypairs_different_cert_public_keys() {
         let mut public_keys = HashSet::new();
-        
+
         for _ in 0..100 {
             let keypair = Keypair::generate();
-            let (certs, _) = generate_ed25519_cert(&keypair)
-                .expect("cert generation must succeed");
-            
+            let (certs, _) = generate_ed25519_cert(&keypair).expect("cert generation must succeed");
+
             let cert_pk = extract_public_key_from_cert(certs[0].as_ref())
                 .expect("pk extraction must succeed");
-            
+
             assert!(
                 public_keys.insert(cert_pk),
                 "P4 violation: Certificate public key collision between different keypairs"
             );
         }
     }
-
 }

@@ -45,15 +45,20 @@ use quinn::{ClientConfig, Connection, Endpoint, Incoming};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
-use crate::messages::{self as messages, PlainRequest, DhtNodeRequest, DhtNodeResponse, GossipSubRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
-use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
-use crate::relay::{Relay, handle_relay_request};
 use crate::dht::DhtNode;
 use crate::dht::Key;
-use crate::identity::{Contact, Identity};
 use crate::gossipsub::GossipSub;
-use crate::protocols::{DhtNodeRpc, GossipSubRpc, RelayRpc, PlainRpc};
+use crate::identity::{Contact, Identity, NamespaceConfig, generate_challenge_nonce};
+use crate::messages::{
+    self as messages, DhtNodeRequest, DhtNodeResponse, GossipSubRequest, NamespaceAuth,
+    PlainRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse,
+};
+use crate::protocols::{DhtNodeRpc, GossipSubRpc, PlainRpc, RelayRpc};
+use crate::relay::{Relay, handle_relay_request};
+use crate::transport::SmartSock;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // Security Limits
@@ -100,7 +105,6 @@ const RPC_COMMAND_CHANNEL_SIZE: usize = 256;
 /// Interval for cleaning up stale connections.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
-
 // ============================================================================
 // Actor Commands
 // ============================================================================
@@ -112,17 +116,12 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Connection>>,
     },
     /// Invalidate a connection after failure
-    InvalidateConnection {
-        peer_id: Identity,
-    },
+    InvalidateConnection { peer_id: Identity },
     /// Mark a connection as successfully used
-    MarkSuccess {
-        peer_id: Identity,
-    },
+    MarkSuccess { peer_id: Identity },
     /// Shutdown the actor
     Quit,
 }
-
 
 // ============================================================================
 // Actor (owns all mutable state)
@@ -191,7 +190,8 @@ impl RpcNodeActor {
 
     fn cleanup_stale_connections(&mut self) {
         // Collect keys to remove (can't mutate while iterating)
-        let stale_peers: Vec<Identity> = self.connections
+        let stale_peers: Vec<Identity> = self
+            .connections
             .iter()
             .filter(|(_, cached)| cached.is_closed() || cached.is_stale())
             .map(|(id, _)| *id)
@@ -204,7 +204,7 @@ impl RpcNodeActor {
                 "cleaned up stale connection"
             );
         }
-        
+
         // Also cleanup stale in-flight entries
         self.cleanup_stale_in_flight();
     }
@@ -214,7 +214,8 @@ impl RpcNodeActor {
     /// in-flight slots, which could lead to connection starvation.
     fn cleanup_stale_in_flight(&mut self) {
         let now = Instant::now();
-        let stale_peers: Vec<Identity> = self.in_flight
+        let stale_peers: Vec<Identity> = self
+            .in_flight
             .iter()
             .filter(|(_, started_at)| now.duration_since(**started_at) > IN_FLIGHT_TIMEOUT)
             .map(|(id, _)| *id)
@@ -264,24 +265,24 @@ impl RpcNodeActor {
             // Use a bounded retry with backoff
             const MAX_WAIT_RETRIES: usize = 10;
             const BASE_WAIT_INTERVAL_MS: u64 = 25;
-            
+
             for retry in 0..MAX_WAIT_RETRIES {
                 let backoff_ms = BASE_WAIT_INTERVAL_MS * (1 << retry.min(5));
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                
+
                 // Check if the connection appeared
                 if let Some(cached) = self.connections.get(&peer_id)
                     && !cached.is_closed()
                 {
                     return Ok(cached.connection.clone());
                 }
-                
+
                 // Check if in_flight cleared (or expired)
                 if !self.in_flight.contains(&peer_id) {
                     break;
                 }
             }
-            
+
             if self.in_flight.contains(&peer_id) {
                 anyhow::bail!("timed out waiting for concurrent connection to peer");
             }
@@ -295,7 +296,9 @@ impl RpcNodeActor {
             // Try to reclaim space by cleaning stale entries first
             self.cleanup_stale_in_flight();
             if self.in_flight.len() >= MAX_IN_FLIGHT_CONNECTIONS {
-                anyhow::bail!("too many concurrent connection attempts (max {})", MAX_IN_FLIGHT_CONNECTIONS);
+                anyhow::bail!(
+                    "too many concurrent connection attempts (max {MAX_IN_FLIGHT_CONNECTIONS})"
+                );
             }
         }
 
@@ -309,32 +312,31 @@ impl RpcNodeActor {
         self.in_flight.pop(&peer_id);
 
         let conn = result?;
-        
+
         // Cache the connection
-        self.connections.put(peer_id, CachedConnection::new(conn.clone()));
-        
+        self.connections
+            .put(peer_id, CachedConnection::new(conn.clone()));
+
         Ok(conn)
     }
 
     async fn connect(&self, contact: &Contact) -> Result<Connection> {
-        let primary = contact.primary_addr()
-            .context("contact has no addresses")?;
-        let addr: SocketAddr = primary.parse()
-            .with_context(|| format!("invalid socket address: {}", primary))?;
+        let primary = contact.primary_addr().context("contact has no addresses")?;
+        let addr: SocketAddr = primary
+            .parse()
+            .with_context(|| format!("invalid socket address: {primary}"))?;
         let sni = identity_to_sni(&contact.identity);
-        
+
         let conn = self
             .endpoint
             .connect_with(self.client_config.clone(), addr, &sni)
-            .with_context(|| format!("failed to initiate connection to {}", addr))?
+            .with_context(|| format!("failed to initiate connection to {addr}"))?
             .await
-            .with_context(|| format!("failed to establish connection to {}", addr))?;
-        
+            .with_context(|| format!("failed to establish connection to {addr}"))?;
+
         Ok(conn)
     }
 }
-
-
 
 #[derive(Clone)]
 struct CachedConnection {
@@ -371,7 +373,6 @@ impl CachedConnection {
     }
 }
 
-
 // ============================================================================
 // RpcNode Handle (public API - cheap to clone)
 // ============================================================================
@@ -383,6 +384,9 @@ pub struct RpcNode {
     client_config: ClientConfig,
     cmd_tx: mpsc::Sender<RpcCommand>,
     smartsock: Option<Arc<SmartSock>>,
+    /// Namespace configuration for payload encryption.
+    /// If set, GossipSub and Plain payloads are encrypted with the session key.
+    namespace_config: Option<Arc<NamespaceConfig>>,
 }
 
 impl RpcNode {
@@ -393,22 +397,32 @@ impl RpcNode {
         _our_peer_id: Identity,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(RPC_COMMAND_CHANNEL_SIZE);
-        
+
         // Spawn the actor
         let actor = RpcNodeActor::new(endpoint.clone(), client_config.clone());
         tokio::spawn(actor.run(cmd_rx));
-        
+
         Self {
             endpoint,
             self_contact,
             client_config,
             cmd_tx,
             smartsock: None,
+            namespace_config: None,
         }
     }
 
     pub fn with_smartsock(mut self, smartsock: Arc<SmartSock>) -> Self {
         self.smartsock = Some(smartsock);
+        self
+    }
+
+    /// Set the namespace configuration for payload encryption.
+    ///
+    /// When set, GossipSub Publish data and Plain payloads are encrypted
+    /// with ChaCha20-Poly1305 using the namespace session key.
+    pub fn with_namespace_config(mut self, config: Arc<NamespaceConfig>) -> Self {
+        self.namespace_config = Some(config);
         self
     }
 
@@ -419,51 +433,62 @@ impl RpcNode {
 
     async fn get_or_connect(&self, contact: &Contact) -> Result<Connection> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        
-        self.cmd_tx.send(RpcCommand::GetOrConnect {
-            contact: contact.clone(),
-            reply: reply_tx,
-        }).await.map_err(|_| anyhow::anyhow!("RPC actor closed"))?;
-        
-        reply_rx.await.map_err(|_| anyhow::anyhow!("RPC actor closed"))?
+
+        self.cmd_tx
+            .send(RpcCommand::GetOrConnect {
+                contact: contact.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("RPC actor closed"))?;
+
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("RPC actor closed"))?
     }
 
     async fn invalidate_connection(&self, peer_id: &Identity) {
-        let _ = self.cmd_tx.send(RpcCommand::InvalidateConnection {
-            peer_id: *peer_id,
-        }).await;
+        let _ = self
+            .cmd_tx
+            .send(RpcCommand::InvalidateConnection { peer_id: *peer_id })
+            .await;
     }
 
     async fn mark_connection_success(&self, peer_id: &Identity) {
-        let _ = self.cmd_tx.send(RpcCommand::MarkSuccess {
-            peer_id: *peer_id,
-        }).await;
+        let _ = self
+            .cmd_tx
+            .send(RpcCommand::MarkSuccess { peer_id: *peer_id })
+            .await;
     }
 
-    pub(crate) async fn rpc(&self, contact: &Contact, request: DhtNodeRequest) -> Result<DhtNodeResponse> {
+    pub(crate) async fn rpc(
+        &self,
+        contact: &Contact,
+        request: DhtNodeRequest,
+    ) -> Result<DhtNodeResponse> {
         let rpc_request = RpcRequest::DhtNode(request);
         let rpc_response = self.rpc_raw(contact, rpc_request).await?;
-        
+
         match rpc_response {
             RpcResponse::DhtNode(dht_response) => Ok(dht_response),
-            RpcResponse::Error { message } => anyhow::bail!("RPC error: {}", message),
-            other => anyhow::bail!("unexpected response type for DHT request: {:?}", other),
+            RpcResponse::Error { message } => anyhow::bail!("RPC error: {message}"),
+            other => anyhow::bail!("unexpected response type for DHT request: {other:?}"),
         }
     }
 
     async fn rpc_raw(&self, contact: &Contact, request: RpcRequest) -> Result<RpcResponse> {
         let peer_id = contact.identity;
         let conn = self.get_or_connect(contact).await?;
-        
+
         let result = self.rpc_inner(&conn, contact, request).await;
-        
+
         match &result {
             Ok(_) => {
                 self.mark_connection_success(&peer_id).await;
             }
             Err(e) => {
-                let error_str = format!("{:?}", e);
-                if error_str.contains("connection") 
+                let error_str = format!("{e:?}");
+                if error_str.contains("connection")
                     || error_str.contains("stream")
                     || error_str.contains("timeout")
                     || error_str.contains("reset")
@@ -473,19 +498,24 @@ impl RpcNode {
                 }
             }
         }
-        
+
         result
     }
 
-    async fn rpc_inner(&self, conn: &Connection, contact: &Contact, request: RpcRequest) -> Result<RpcResponse> {
+    async fn rpc_inner(
+        &self,
+        conn: &Connection,
+        contact: &Contact,
+        request: RpcRequest,
+    ) -> Result<RpcResponse> {
         tokio::time::timeout(RPC_STREAM_TIMEOUT, async {
             let (mut send, mut recv) = conn
                 .open_bi()
                 .await
                 .context("failed to open bidirectional stream")?;
 
-            let request_bytes = messages::serialize_request(&request)
-                .context("failed to serialize request")?;
+            let request_bytes =
+                messages::serialize_request(&request).context("failed to serialize request")?;
             let len = request_bytes.len() as u32;
             send.write_all(&len.to_be_bytes()).await?;
             send.write_all(&request_bytes).await?;
@@ -502,7 +532,9 @@ impl RpcNode {
                     max = MAX_RESPONSE_SIZE,
                     "peer sent oversized response"
                 );
-                anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
+                anyhow::bail!(
+                    "response too large: {len} bytes (max {MAX_RESPONSE_SIZE})"
+                );
             }
 
             let mut response_bytes = vec![0u8; len];
@@ -522,16 +554,16 @@ impl RpcNode {
         addrs: &[String],
     ) -> Result<Connection> {
         let mut last_error = None;
-        
+
         for addr_str in addrs {
             let addr: SocketAddr = match addr_str.parse() {
                 Ok(a) => a,
                 Err(e) => {
-                    last_error = Some(anyhow::anyhow!("invalid address {}: {}", addr_str, e));
+                    last_error = Some(anyhow::anyhow!("invalid address {addr_str}: {e}"));
                     continue;
                 }
             };
-            
+
             match self.connect_and_verify(addr, peer_id).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
@@ -540,7 +572,7 @@ impl RpcNode {
                 }
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no addresses provided for peer")))
     }
 
@@ -556,10 +588,8 @@ impl RpcNode {
             .as_ref()
             .context("SmartSock not configured")?;
 
-        let direct_socket_addrs: Vec<std::net::SocketAddr> = direct_addrs
-            .iter()
-            .filter_map(|a| a.parse().ok())
-            .collect();
+        let direct_socket_addrs: Vec<std::net::SocketAddr> =
+            direct_addrs.iter().filter_map(|a| a.parse().ok()).collect();
 
         smartsock.register_peer(peer_id, direct_socket_addrs).await;
 
@@ -596,18 +626,22 @@ impl RpcNode {
         let connecting = self
             .endpoint
             .connect_with(self.client_config.clone(), addr, &sni)
-            .with_context(|| format!("failed to initiate connection to {}", addr))?;
-        
+            .with_context(|| format!("failed to initiate connection to {addr}"))?;
+
         debug!(addr = %addr, "awaiting connection establishment");
         let conn = connecting
             .await
-            .with_context(|| format!("failed to establish connection to {}", addr))?;
-        
+            .with_context(|| format!("failed to establish connection to {addr}"))?;
+
         debug!(addr = %addr, "connection established");
         Ok(conn)
     }
 
-    async fn send_relay_rpc(&self, conn: &Connection, request: RelayRequest) -> Result<RelayResponse> {
+    async fn send_relay_rpc(
+        &self,
+        conn: &Connection,
+        request: RelayRequest,
+    ) -> Result<RelayResponse> {
         tokio::time::timeout(RPC_STREAM_TIMEOUT, async {
             let (mut send, mut recv) = conn
                 .open_bi()
@@ -615,8 +649,8 @@ impl RpcNode {
                 .context("failed to open bidirectional stream")?;
 
             let rpc_request = RpcRequest::Relay(request);
-            let request_bytes = messages::serialize_request(&rpc_request)
-                .context("failed to serialize request")?;
+            let request_bytes =
+                messages::serialize_request(&rpc_request).context("failed to serialize request")?;
             let len = request_bytes.len() as u32;
             send.write_all(&len.to_be_bytes()).await?;
             send.write_all(&request_bytes).await?;
@@ -632,7 +666,9 @@ impl RpcNode {
                     max = MAX_RESPONSE_SIZE,
                     "peer sent oversized response on existing connection"
                 );
-                anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
+                anyhow::bail!(
+                    "response too large: {len} bytes (max {MAX_RESPONSE_SIZE})"
+                );
             }
 
             let mut response_bytes = vec![0u8; len];
@@ -640,11 +676,11 @@ impl RpcNode {
 
             let rpc_response: RpcResponse = messages::deserialize_bounded(&response_bytes)
                 .context("failed to deserialize response")?;
-            
+
             match rpc_response {
                 RpcResponse::Relay(relay_response) => Ok(relay_response),
-                RpcResponse::Error { message } => anyhow::bail!("Relay RPC error: {}", message),
-                other => anyhow::bail!("unexpected response type for Relay: {:?}", other),
+                RpcResponse::Error { message } => anyhow::bail!("Relay RPC error: {message}"),
+                other => anyhow::bail!("unexpected response type for Relay: {other:?}"),
             }
         })
         .await
@@ -673,7 +709,7 @@ impl DhtNodeRpc for RpcNode {
                     Ok(nodes)
                 }
             }
-            other => anyhow::bail!("unexpected response to FindNode: {:?}", other),
+            other => anyhow::bail!("unexpected response to FindNode: {other:?}"),
         }
     }
 
@@ -693,9 +729,13 @@ impl DhtNodeRpc for RpcNode {
                         max = MAX_VALUE_SIZE,
                         "peer returned oversized value, rejecting"
                     );
-                    anyhow::bail!("value too large: {} bytes (max {})", v.len(), MAX_VALUE_SIZE);
+                    anyhow::bail!(
+                        "value too large: {} bytes (max {})",
+                        v.len(),
+                        MAX_VALUE_SIZE
+                    );
                 }
-                
+
                 let closer = if closer.len() > MAX_CONTACTS_PER_RESPONSE {
                     warn!(
                         peer = %to.primary_addr().unwrap_or("<no addr>"),
@@ -707,10 +747,10 @@ impl DhtNodeRpc for RpcNode {
                 } else {
                     closer
                 };
-                
+
                 Ok((value, closer))
             }
-            other => anyhow::bail!("unexpected response to FindValue: {:?}", other),
+            other => anyhow::bail!("unexpected response to FindValue: {other:?}"),
         }
     }
 
@@ -722,7 +762,7 @@ impl DhtNodeRpc for RpcNode {
         };
         match self.rpc(to, request).await? {
             DhtNodeResponse::Ack => Ok(()),
-            other => anyhow::bail!("unexpected response to Store: {:?}", other),
+            other => anyhow::bail!("unexpected response to Store: {other:?}"),
         }
     }
 
@@ -732,7 +772,7 @@ impl DhtNodeRpc for RpcNode {
         };
         match self.rpc(to, request).await? {
             DhtNodeResponse::Ack => Ok(()),
-            other => anyhow::bail!("unexpected response to Ping: {:?}", other),
+            other => anyhow::bail!("unexpected response to Ping: {other:?}"),
         }
     }
 
@@ -743,37 +783,81 @@ impl DhtNodeRpc for RpcNode {
         };
         match self.rpc(to, request).await? {
             DhtNodeResponse::Reachable { reachable } => Ok(reachable),
-            other => anyhow::bail!("unexpected response to CheckReachability: {:?}", other),
+            other => anyhow::bail!("unexpected response to CheckReachability: {other:?}"),
         }
     }
 }
-
 
 #[async_trait]
 impl GossipSubRpc for RpcNode {
     async fn send_gossipsub(&self, to: &Contact, message: GossipSubRequest) -> Result<()> {
+        // Encrypt Publish data if namespace config is set
+        let message = if let Some(ref ns_config) = self.namespace_config {
+            match message {
+                GossipSubRequest::Publish {
+                    topic,
+                    msg_id,
+                    source,
+                    seqno,
+                    data,
+                    signature,
+                } => {
+                    let encrypted_data = ns_config
+                        .encrypt(&data)
+                        .context("failed to encrypt GossipSub payload")?;
+                    GossipSubRequest::Publish {
+                        topic,
+                        msg_id,
+                        source,
+                        seqno,
+                        data: encrypted_data,
+                        signature,
+                    }
+                }
+                other => other, // Non-Publish messages pass through unchanged
+            }
+        } else {
+            message
+        };
+
         let request = RpcRequest::GossipSub(message);
         match self.rpc_raw(to, request).await? {
             RpcResponse::GossipSubAck => Ok(()),
-            RpcResponse::Error { message } => anyhow::bail!("GossipSub rejected: {}", message),
-            other => anyhow::bail!("unexpected response to GossipSub: {:?}", other),
+            RpcResponse::Error { message } => anyhow::bail!("GossipSub rejected: {message}"),
+            other => anyhow::bail!("unexpected response to GossipSub: {other:?}"),
         }
     }
 }
-
 
 #[async_trait]
 impl PlainRpc for RpcNode {
     async fn send(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>> {
-        let rpc_request = RpcRequest::Plain(request);
+        // Encrypt request payload if namespace config is set
+        let encrypted_request = if let Some(ref ns_config) = self.namespace_config {
+            ns_config
+                .encrypt(&request)
+                .context("failed to encrypt Plain request")?
+        } else {
+            request
+        };
+
+        let rpc_request = RpcRequest::Plain(encrypted_request);
         match self.rpc_raw(to, rpc_request).await? {
-            RpcResponse::Plain(response) => Ok(response),
-            RpcResponse::Error { message } => anyhow::bail!("Plain request rejected: {}", message),
-            other => anyhow::bail!("unexpected response to Plain: {:?}", other),
+            RpcResponse::Plain(response) => {
+                // Decrypt response if namespace config is set
+                if let Some(ref ns_config) = self.namespace_config {
+                    ns_config
+                        .decrypt(&response)
+                        .context("failed to decrypt Plain response")
+                } else {
+                    Ok(response)
+                }
+            }
+            RpcResponse::Error { message } => anyhow::bail!("Plain request rejected: {message}"),
+            other => anyhow::bail!("unexpected response to Plain: {other:?}"),
         }
     }
 }
-
 
 #[async_trait]
 impl RelayRpc for RpcNode {
@@ -783,18 +867,21 @@ impl RelayRpc for RpcNode {
         from_peer: Identity,
         session_id: [u8; 16],
     ) -> Result<()> {
-        let relay_addr = relay.primary_addr()
+        let relay_addr = relay
+            .primary_addr()
             .context("relay contact has no address")?;
-        let relay_socket: std::net::SocketAddr = relay_addr.parse()
-            .context("invalid relay address")?;
-        
+        let relay_socket: std::net::SocketAddr =
+            relay_addr.parse().context("invalid relay address")?;
+
         // Configure SmartSock to route traffic to from_peer through the relay
-        let smartsock = self.smartsock.as_ref()
+        let smartsock = self
+            .smartsock
+            .as_ref()
             .context("SmartSock not configured")?;
-        
+
         // Register the peer (we may not know their direct addresses, use empty)
         smartsock.register_peer(from_peer, vec![]).await;
-        
+
         // Add relay tunnel
         let added = smartsock
             .add_relay_tunnel(&from_peer, session_id, relay_socket)
@@ -803,23 +890,23 @@ impl RelayRpc for RpcNode {
         if !added {
             anyhow::bail!("failed to add relay tunnel");
         }
-        
+
         // Activate relay path
         let switched = smartsock.use_relay_path(&from_peer, session_id).await;
         if !switched {
             anyhow::bail!("failed to activate relay path");
         }
-        
+
         // Send an initial probe packet to the relay to register our address
         smartsock.send_relay_probe(&from_peer, session_id).await?;
-        
+
         debug!(
             session = hex::encode(&session_id[..4]),
             from_peer = ?from_peer,
             relay = %relay_addr,
             "completed relay session as receiver"
         );
-        
+
         Ok(())
     }
 
@@ -857,18 +944,74 @@ impl RelayRpc for RpcNode {
     }
 }
 
+/// Per-connection namespace authentication state.
+///
+/// Shared across all streams on a connection. Authentication is performed
+/// once per connection, not per stream.
+#[derive(Debug)]
+pub struct NamespaceAuthState {
+    /// Whether this peer has been authenticated for our namespace.
+    authenticated: AtomicBool,
+    /// Challenge nonce we sent (for verifying their response).
+    our_challenge: tokio::sync::RwLock<Option<[u8; 32]>>,
+}
+
+impl NamespaceAuthState {
+    pub fn new() -> Self {
+        Self {
+            authenticated: AtomicBool::new(false),
+            our_challenge: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Mark peer as authenticated.
+    pub fn set_authenticated(&self) {
+        self.authenticated.store(true, Ordering::SeqCst);
+    }
+
+    /// Check if peer is authenticated.
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::SeqCst)
+    }
+
+    /// Store our challenge nonce.
+    pub async fn set_challenge(&self, nonce: [u8; 32]) {
+        *self.our_challenge.write().await = Some(nonce);
+    }
+
+    /// Get our challenge nonce.
+    pub async fn get_challenge(&self) -> Option<[u8; 32]> {
+        *self.our_challenge.read().await
+    }
+}
+
+impl Default for NamespaceAuthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 
+/// Handle incoming connection with namespace authentication.
+///
+/// This version supports namespace isolation via challenge-response:
+/// - DHT and Relay streams are always allowed (infrastructure)
+/// - Plain (app) streams require namespace authentication first
+/// - GossipSub streams require namespace authentication
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Sync + 'static>(
+pub async fn handle_connection_with_namespace<
+    N: DhtNodeRpc + GossipSubRpc + Clone + Send + Sync + 'static,
+>(
     node: DhtNode<N>,
     gossipsub: Option<GossipSub<N>>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
     direct_tx: Option<PlainRequest>,
+    namespace_config: Option<Arc<NamespaceConfig>>,
+    our_pubkey: [u8; 32],
 ) -> Result<()> {
     // Extract relay from smartsock
     let udprelay = smartsock.as_ref().and_then(|ss| ss.relay());
@@ -880,8 +1023,18 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
 
     let Some(verified_identity) = extract_verified_identity(&connection) else {
         warn!(remote = %remote, "rejecting connection: could not verify peer identity");
-        return Err(anyhow::anyhow!("could not verify peer identity from certificate"));
+        return Err(anyhow::anyhow!(
+            "could not verify peer identity from certificate"
+        ));
     };
+
+    // Create per-connection namespace auth state
+    let ns_auth_state = Arc::new(NamespaceAuthState::new());
+
+    // If no namespace config, auto-authenticate (global namespace)
+    if namespace_config.is_none() {
+        ns_auth_state.set_authenticated();
+    }
 
     // Register incoming peer in DHT routing table for identity resolution.
     // This enables GossipSub to send messages to peers that connected to us.
@@ -889,7 +1042,7 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
     // via mTLS certificate, bypassing the S/Kademlia PoW requirement.
     let incoming_contact = Contact::unsigned(verified_identity, vec![remote.to_string()]);
     node.observe_direct_peer(incoming_contact).await;
-    
+
     if let Some(ss) = &smartsock {
         ss.register_peer(verified_identity, vec![remote]).await;
         debug!(
@@ -957,9 +1110,24 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
         let verified_id = verified_identity;
         let from_contact = Contact::unsigned(verified_id, vec![remote_addr.to_string()]);
         let direct_sender = direct_tx.clone();
+        let ns_config = namespace_config.clone();
+        let ns_auth = ns_auth_state.clone();
+        let our_pk = our_pubkey;
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_stream(node, gossipsub_h, udprelay, udprelay_addr, stream, remote_addr, from_contact, direct_sender).await
+            if let Err(e) = handle_stream_with_namespace(
+                node,
+                gossipsub_h,
+                udprelay,
+                udprelay_addr,
+                stream,
+                remote_addr,
+                from_contact,
+                direct_sender,
+                ns_config,
+                ns_auth,
+                our_pk,
+            )
+            .await
             {
                 debug!(error = ?e, "stream error");
             }
@@ -968,7 +1136,7 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
+async fn handle_stream_with_namespace<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
     gossipsub: Option<GossipSub<N>>,
     udprelay: Option<Relay>,
@@ -977,8 +1145,13 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     remote_addr: SocketAddr,
     from_contact: Contact,
     direct_tx: Option<PlainRequest>,
+    namespace_config: Option<Arc<NamespaceConfig>>,
+    ns_auth_state: Arc<NamespaceAuthState>,
+    our_pubkey: [u8; 32],
 ) -> Result<()> {
     let verified_identity = from_contact.identity;
+    let peer_pubkey = *verified_identity.as_bytes();
+
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(REQUEST_READ_TIMEOUT, recv.read_exact(&mut len_buf))
         .await
@@ -993,7 +1166,9 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
             "rejecting oversized request"
         );
         let error_response = DhtNodeResponse::Error {
-            message: format!("request too large: {} bytes (max {})", len, MAX_REQUEST_SIZE),
+            message: format!(
+                "request too large: {len} bytes (max {MAX_REQUEST_SIZE})"
+            ),
         };
         let response_bytes = bincode::serialize(&error_response)?;
         let response_len = response_bytes.len() as u32;
@@ -1008,8 +1183,8 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
         .await
         .map_err(|_| anyhow::anyhow!("request body read timed out"))??;
 
-    let request: RpcRequest =
-        crate::messages::deserialize_request(&request_bytes).context("failed to deserialize request")?;
+    let request: RpcRequest = crate::messages::deserialize_request(&request_bytes)
+        .context("failed to deserialize request")?;
 
     if let Some(claimed_id) = request.sender_identity()
         && claimed_id != verified_identity
@@ -1034,9 +1209,31 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     // NOTE: RelayRequest::Register handling removed - mesh-only signaling
     // NAT peers now receive signals via GossipSub mesh instead of dedicated QUIC streams
 
-    let response = match tokio::time::timeout(
+    // Handle namespace-gated requests
+    // SECURITY: DHT and Relay are global (infrastructure for discovery and NAT traversal)
+    // GossipSub and Plain require namespace authentication
+    // This isolates application traffic while allowing global peer discovery.
+    let requires_auth = matches!(request, RpcRequest::GossipSub(_) | RpcRequest::Plain(_));
+
+    if requires_auth && namespace_config.is_some() && !ns_auth_state.is_authenticated() {
+        warn!(
+            remote = %remote_addr,
+            "rejecting request: namespace authentication required"
+        );
+        let error_response = RpcResponse::Error {
+            message: "Namespace authentication required. Send NamespaceAuth first.".to_string(),
+        };
+        let response_bytes = bincode::serialize(&error_response)?;
+        let len = response_bytes.len() as u32;
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&response_bytes).await?;
+        send.finish()?;
+        return Ok(());
+    }
+
+    let response = if let Ok(resp) = tokio::time::timeout(
         REQUEST_PROCESS_TIMEOUT,
-        handle_rpc_request(
+        handle_rpc_request_with_namespace(
             node,
             request,
             remote_addr,
@@ -1045,14 +1242,16 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
             udprelay,
             udprelay_addr,
             direct_tx,
-        )
-    ).await {
-        Ok(resp) => resp,
-        Err(_) => {
-            warn!(remote = %remote_addr, "request processing timed out");
-            RpcResponse::Error {
-                message: "request processing timeout".to_string(),
-            }
+            namespace_config,
+            ns_auth_state,
+            our_pubkey,
+            peer_pubkey,
+        ),
+    )
+    .await { resp } else {
+        warn!(remote = %remote_addr, "request processing timed out");
+        RpcResponse::Error {
+            message: "request processing timeout".to_string(),
         }
     };
 
@@ -1066,7 +1265,7 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_rpc_request<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
+async fn handle_rpc_request_with_namespace<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
     request: RpcRequest,
     remote_addr: SocketAddr,
@@ -1075,6 +1274,10 @@ async fn handle_rpc_request<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static
     udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
     direct_tx: Option<PlainRequest>,
+    namespace_config: Option<Arc<NamespaceConfig>>,
+    ns_auth_state: Arc<NamespaceAuthState>,
+    our_pubkey: [u8; 32],
+    peer_pubkey: [u8; 32],
 ) -> RpcResponse {
     match request {
         RpcRequest::DhtNode(dht_request) => {
@@ -1082,37 +1285,109 @@ async fn handle_rpc_request<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static
             RpcResponse::DhtNode(dht_response)
         }
         RpcRequest::Relay(relay_request) => {
-            let relay_response = handle_relay_request(
-                relay_request,
-                remote_addr,
-                udprelay.as_ref(),
-                udprelay_addr,
-            ).await;
+            let relay_response =
+                handle_relay_request(relay_request, remote_addr, udprelay.as_ref(), udprelay_addr)
+                    .await;
             RpcResponse::Relay(relay_response)
         }
+        RpcRequest::NamespaceAuth(auth_msg) => {
+            handle_namespace_auth(
+                auth_msg,
+                namespace_config,
+                ns_auth_state,
+                our_pubkey,
+                peer_pubkey,
+            )
+            .await
+        }
         RpcRequest::GossipSub(message) => {
+            // Decrypt GossipSub Publish data if namespace config is set
+            let message = if let Some(ref ns_config) = namespace_config {
+                match message {
+                    GossipSubRequest::Publish {
+                        topic,
+                        msg_id,
+                        source,
+                        seqno,
+                        data,
+                        signature,
+                    } => match ns_config.decrypt(&data) {
+                        Ok(decrypted_data) => GossipSubRequest::Publish {
+                            topic,
+                            msg_id,
+                            source,
+                            seqno,
+                            data: decrypted_data,
+                            signature,
+                        },
+                        Err(e) => {
+                            warn!("failed to decrypt GossipSub payload: {}", e);
+                            return RpcResponse::Error {
+                                message: "failed to decrypt payload".to_string(),
+                            };
+                        }
+                    },
+                    other => other, // Non-Publish messages pass through unchanged
+                }
+            } else {
+                message
+            };
             handle_gossipsub_rpc(&from_contact, message, gossipsub).await
         }
         RpcRequest::Plain(request_data) => {
+            // Decrypt Plain request if namespace config is set
+            let decrypted_data = if let Some(ref ns_config) = namespace_config {
+                match ns_config.decrypt(&request_data) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("failed to decrypt Plain request: {}", e);
+                        return RpcResponse::Error {
+                            message: "failed to decrypt payload".to_string(),
+                        };
+                    }
+                }
+            } else {
+                request_data
+            };
+
             if let Some(tx) = direct_tx {
                 // Create a oneshot channel for the response
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                
-                // Send request to handler and wait for response
-                if tx.send((from_contact.identity, request_data, response_tx)).await.is_ok() {
+
+                // Send decrypted request to handler and wait for response
+                if tx
+                    .send((from_contact.identity, decrypted_data, response_tx))
+                    .await
+                    .is_ok()
+                {
                     // Wait for the handler to provide a response (with timeout)
                     match tokio::time::timeout(REQUEST_PROCESS_TIMEOUT, response_rx).await {
-                        Ok(Ok(response_data)) => RpcResponse::Plain(response_data),
-                        Ok(Err(_)) => RpcResponse::Error { 
-                            message: "request handler dropped without responding".to_string() 
+                        Ok(Ok(response_data)) => {
+                            // Encrypt response if namespace config is set
+                            if let Some(ref ns_config) = namespace_config {
+                                match ns_config.encrypt(&response_data) {
+                                    Ok(encrypted) => RpcResponse::Plain(encrypted),
+                                    Err(e) => {
+                                        warn!("failed to encrypt Plain response: {}", e);
+                                        RpcResponse::Error {
+                                            message: "failed to encrypt response".to_string(),
+                                        }
+                                    }
+                                }
+                            } else {
+                                RpcResponse::Plain(response_data)
+                            }
+                        }
+                        Ok(Err(_)) => RpcResponse::Error {
+                            message: "request handler dropped without responding".to_string(),
                         },
-                        Err(_) => RpcResponse::Error { 
-                            message: "request handler timed out".to_string() 
+                        Err(_) => RpcResponse::Error {
+                            message: "request handler timed out".to_string(),
                         },
                     }
                 } else {
-                    RpcResponse::Error { 
-                        message: "request handler channel closed".to_string() 
+                    RpcResponse::Error {
+                        message: "request handler channel closed".to_string(),
                     }
                 }
             } else {
@@ -1123,6 +1398,116 @@ async fn handle_rpc_request<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static
     }
 }
 
+/// Handle namespace authentication challenge-response.
+///
+/// Protocol:
+/// 1. Client sends MutualChallenge with their nonce
+/// 2. Server responds with MutualChallenge containing:
+///    - Our nonce (challenge for client)
+///    - Response to client's nonce (proving we're same namespace)
+/// 3. Client verifies our response
+/// 4. Client sends Response with proof for our nonce
+/// 5. Server verifies, marks connection as authenticated
+async fn handle_namespace_auth(
+    auth_msg: NamespaceAuth,
+    namespace_config: Option<Arc<NamespaceConfig>>,
+    ns_auth_state: Arc<NamespaceAuthState>,
+    our_pubkey: [u8; 32],
+    peer_pubkey: [u8; 32],
+) -> RpcResponse {
+    // If no namespace config, we're in global mode - auto-authenticate
+    let Some(ns_config) = namespace_config else {
+        ns_auth_state.set_authenticated();
+        return RpcResponse::NamespaceAuth(NamespaceAuth::Authenticated);
+    };
+
+    // If namespace config is global, auto-authenticate
+    if ns_config.is_global() {
+        ns_auth_state.set_authenticated();
+        return RpcResponse::NamespaceAuth(NamespaceAuth::Authenticated);
+    }
+
+    match auth_msg {
+        NamespaceAuth::MutualChallenge {
+            our_nonce: peer_nonce,
+            response_to_peer,
+        } => {
+            // Peer sent their challenge nonce and optionally their response to our challenge
+
+            // First, verify their response if we sent a challenge
+            if let Some(response) = response_to_peer
+                && let Some(our_challenge) = ns_auth_state.get_challenge().await {
+                    if ns_config.verify_response(
+                        &our_challenge,
+                        &peer_pubkey,
+                        &our_pubkey,
+                        &response,
+                    ) {
+                        // Peer proved they're in our namespace!
+                        ns_auth_state.set_authenticated();
+                        debug!(
+                            peer = hex::encode(&peer_pubkey[..8]),
+                            "namespace authentication successful"
+                        );
+                        return RpcResponse::NamespaceAuth(NamespaceAuth::Authenticated);
+                    }
+                    warn!(
+                        peer = hex::encode(&peer_pubkey[..8]),
+                        "namespace authentication failed: invalid response"
+                    );
+                    return RpcResponse::NamespaceAuth(NamespaceAuth::Rejected {
+                        reason: "Invalid namespace response".to_string(),
+                    });
+                }
+
+            // Generate our challenge for the peer
+            let our_challenge = generate_challenge_nonce();
+            ns_auth_state.set_challenge(our_challenge).await;
+
+            // Compute our response to their challenge
+            let our_response = ns_config.compute_response(&peer_nonce, &our_pubkey, &peer_pubkey);
+
+            RpcResponse::NamespaceAuth(NamespaceAuth::MutualChallenge {
+                our_nonce: our_challenge,
+                response_to_peer: Some(our_response),
+            })
+        }
+
+        NamespaceAuth::Challenge { nonce } => {
+            // Simple one-way challenge (peer challenges us)
+            let response = ns_config.compute_response(&nonce, &our_pubkey, &peer_pubkey);
+            RpcResponse::NamespaceAuth(NamespaceAuth::Response { proof: response })
+        }
+
+        NamespaceAuth::Response { proof } => {
+            // Peer responding to our challenge
+            if let Some(our_challenge) = ns_auth_state.get_challenge().await
+                && ns_config.verify_response(&our_challenge, &peer_pubkey, &our_pubkey, &proof) {
+                    ns_auth_state.set_authenticated();
+                    debug!(
+                        peer = hex::encode(&peer_pubkey[..8]),
+                        "namespace authentication successful"
+                    );
+                    return RpcResponse::NamespaceAuth(NamespaceAuth::Authenticated);
+                }
+
+            warn!(
+                peer = hex::encode(&peer_pubkey[..8]),
+                "namespace authentication failed"
+            );
+            RpcResponse::NamespaceAuth(NamespaceAuth::Rejected {
+                reason: "Invalid namespace response or no pending challenge".to_string(),
+            })
+        }
+
+        NamespaceAuth::Authenticated | NamespaceAuth::Rejected { .. } => {
+            // These are responses, not requests
+            RpcResponse::Error {
+                message: "Invalid namespace auth message type".to_string(),
+            }
+        }
+    }
+}
 
 async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
     node: &DhtNode<N>,
@@ -1200,22 +1585,19 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
                 probe_addr_len = probe_addr.len(),
                 "handling CHECK_REACHABILITY request"
             );
-            
+
             // SECURITY: Validate probe_addr is a valid socket address to prevent
             // this node being used as an amplification vector against arbitrary targets.
-            let probe_socket: SocketAddr = match probe_addr.parse() {
-                Ok(addr) => addr,
-                Err(_) => {
-                    warn!(
-                        from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                        probe_addr = %probe_addr_log.as_ref(),
-                        probe_addr_len = probe_addr.len(),
-                        "CHECK_REACHABILITY rejected: invalid socket address"
-                    );
-                    return DhtNodeResponse::Reachable { reachable: false };
-                }
+            let probe_socket: SocketAddr = if let Ok(addr) = probe_addr.parse() { addr } else {
+                warn!(
+                    from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                    probe_addr = %probe_addr_log.as_ref(),
+                    probe_addr_len = probe_addr.len(),
+                    "CHECK_REACHABILITY rejected: invalid socket address"
+                );
+                return DhtNodeResponse::Reachable { reachable: false };
             };
-            
+
             // SECURITY: Only allow probing addresses that share the same IP as the
             // connection's remote address. This prevents attackers from using us
             // to probe arbitrary third-party addresses (amplification attack vector).
@@ -1229,7 +1611,7 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
                 );
                 return DhtNodeResponse::Reachable { reachable: false };
             }
-            
+
             // SECURITY: Validate that probe_addr is in the requesting peer's own address list.
             // This ensures CheckReachability is only used for self-checks (NAT detection),
             // not for probing arbitrary ports on the same IP (port scanning defense).
@@ -1242,7 +1624,7 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
                 );
                 return DhtNodeResponse::Reachable { reachable: false };
             }
-            
+
             // SECURITY: Reject probes to private/internal IP ranges.
             // Even if the attacker uses their own IP, we don't want to be used to probe
             // their internal network (could leak information about our network topology).
@@ -1261,10 +1643,10 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
                         // Note: is_unique_local (fc00::/7) and is_unicast_link_local (fe80::/10)
                         // are unstable, so we check manually
                         || (ip.segments()[0] & 0xfe00) == 0xfc00  // fc00::/7 (unique local)
-                        || (ip.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 (link-local)
+                        || (ip.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
                 }
             };
-            
+
             if is_private_or_internal {
                 warn!(
                     from = ?hex::encode(&from.identity.as_bytes()[..8]),
@@ -1273,19 +1655,17 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
                 );
                 return DhtNodeResponse::Reachable { reachable: false };
             }
-            
+
             // Create a contact for the probe address
             let probe_contact = Contact::single(from.identity, probe_addr.clone());
-            
+
             // Attempt to ping back with a short timeout
-            let reachable = tokio::time::timeout(
-                Duration::from_secs(5),
-                node.network().ping(&probe_contact),
-            )
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
-            
+            let reachable =
+                tokio::time::timeout(Duration::from_secs(5), node.network().ping(&probe_contact))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+
             debug!(
                 from = ?hex::encode(&from.identity.as_bytes()[..8]),
                 probe_addr = %probe_addr_log.as_ref(),
@@ -1293,7 +1673,7 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
                 reachable = reachable,
                 "CHECK_REACHABILITY result"
             );
-            
+
             DhtNodeResponse::Reachable { reachable }
         }
     }
@@ -1313,7 +1693,7 @@ async fn handle_gossipsub_rpc<N: GossipSubRpc + Send + Sync + 'static>(
         if let Err(e) = gs.handle_message(from, message).await {
             warn!(from = ?hex::encode(&from.identity.as_bytes()[..8]), error = %e, "GossipSub handler returned error");
             RpcResponse::Error {
-                message: format!("GossipSub error: {}", e),
+                message: format!("GossipSub error: {e}"),
             }
         } else {
             RpcResponse::GossipSubAck

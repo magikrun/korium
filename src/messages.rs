@@ -26,18 +26,15 @@
 //! This provides content-addressing and deduplication.
 
 use bincode::Options;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::dht::Key;
 use crate::identity::{Contact, Identity};
 
 /// Channel sender for plain requests that expect a response.
 /// Sends (sender_identity, request_data, response_channel).
-pub type PlainRequest = tokio::sync::mpsc::Sender<(
-    Identity,
-    Vec<u8>,
-    tokio::sync::oneshot::Sender<Vec<u8>>,
-)>;
+pub type PlainRequest =
+    tokio::sync::mpsc::Sender<(Identity, Vec<u8>, tokio::sync::oneshot::Sender<Vec<u8>>)>;
 
 /// Maximum size of a stored value in the DHT (1 MiB).
 /// Larger values should be chunked or stored externally.
@@ -52,7 +49,7 @@ pub const MAX_DESERIALIZE_SIZE: u64 = (MAX_VALUE_SIZE as u64) + 4096;
 fn bincode_options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_limit(MAX_DESERIALIZE_SIZE)
-    .with_fixint_encoding()
+        .with_fixint_encoding()
 }
 
 /// Deserialize with size bounds enforced.
@@ -68,7 +65,6 @@ pub fn serialize_request(request: &RpcRequest) -> Result<Vec<u8>, bincode::Error
 pub fn deserialize_request(data: &[u8]) -> Result<RpcRequest, bincode::Error> {
     bincode_options().deserialize(data)
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DhtNodeRequest {
@@ -127,7 +123,6 @@ pub enum DhtNodeResponse {
     },
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RelayRequest {
     /// Request to initiate or complete a relay session between two peers.
@@ -167,9 +162,7 @@ pub enum RelayResponse {
         relay_data_addr: String,
     },
     /// Request rejected with reason.
-    Rejected {
-        reason: String,
-    },
+    Rejected { reason: String },
     /// Push notification: another peer wants to connect via relay.
     /// NAT-bound node should initiate Connect with the provided session_id.
     Incoming {
@@ -185,23 +178,16 @@ pub enum RelayResponse {
     },
 }
 
-
 pub type MessageId = [u8; 32];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GossipSubRequest {
     /// Subscribe to a topic - informs peer we want messages for this topic.
-    Subscribe {
-        topic: String,
-    },
+    Subscribe { topic: String },
     /// Unsubscribe from a topic - informs peer we no longer want messages.
-    Unsubscribe {
-        topic: String,
-    },
+    Unsubscribe { topic: String },
     /// GRAFT - request to join the mesh for a topic.
-    Graft {
-        topic: String,
-    },
+    Graft { topic: String },
     /// PRUNE - request to leave the mesh for a topic.
     /// Per GossipSub v1.1: includes backoff duration and optional peer exchange.
     Prune {
@@ -227,27 +213,24 @@ pub enum GossipSubRequest {
         msg_ids: Vec<MessageId>,
     },
     /// IWANT - request messages by their IDs.
-    IWant {
-        msg_ids: Vec<MessageId>,
-    },
+    IWant { msg_ids: Vec<MessageId> },
     /// IDONTWANT - preemptively tell peers not to send us certain messages.
     /// Per GossipSub v1.2: optimization to reduce bandwidth by indicating
     /// messages we've already received via another path.
-    IDontWant {
-        msg_ids: Vec<MessageId>,
-    },
+    IDontWant { msg_ids: Vec<MessageId> },
     /// RelaySignal - relay signaling message forwarded through mesh.
-    /// 
+    ///
     /// Used for mesh-mediated signaling: instead of maintaining dedicated
     /// connections to relays, signaling messages are forwarded through
     /// GossipSub mesh connections. This reduces connection overhead.
-    /// 
+    ///
     /// The relay sends this to notify a NAT-bound peer about an incoming
     /// connection request. The target peer processes it and completes
     /// the relay handshake.
-    /// 
+    ///
     /// SECURITY: The signature field cryptographically binds the signal to
     /// from_peer's identity, preventing forgery by intermediate mesh peers.
+    /// The timestamp_ms field prevents indefinite replay of captured signals.
     RelaySignal {
         /// The target peer identity (recipient of the signal).
         target: Identity,
@@ -257,7 +240,10 @@ pub enum GossipSubRequest {
         session_id: [u8; 16],
         /// Address to send relay data packets to.
         relay_data_addr: String,
-        /// Ed25519 signature by from_peer over (target || session_id || relay_data_addr).
+        /// Timestamp when the signal was created (milliseconds since epoch).
+        /// SECURITY: Limits replay window - signals older than RELAY_SIGNAL_MAX_AGE_MS are rejected.
+        timestamp_ms: u64,
+        /// Ed25519 signature by from_peer over (target || session_id || timestamp || relay_data_addr).
         /// SECURITY: Prevents forgery of relay signals by malicious mesh peers.
         signature: Vec<u8>,
     },
@@ -279,8 +265,6 @@ impl GossipSubRequest {
     }
 }
 
-
-
 #[derive(Clone, Debug)]
 pub struct Message {
     pub topic: String,
@@ -288,12 +272,50 @@ pub struct Message {
     pub data: Vec<u8>,
 }
 
+/// Length of namespace challenge nonce (must match identity.rs).
+pub const NAMESPACE_CHALLENGE_LEN: usize = 32;
+
+/// Length of namespace challenge response (must match identity.rs).
+pub const NAMESPACE_RESPONSE_LEN: usize = 32;
+
+/// Namespace challenge-response for proving namespace membership.
+///
+/// This is used to authenticate peers before allowing application streams.
+/// DHT and Relay streams are always allowed (infrastructure).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NamespaceAuth {
+    /// Challenge: verifier sends a random nonce to the prover.
+    Challenge {
+        /// Random 32-byte nonce.
+        nonce: [u8; NAMESPACE_CHALLENGE_LEN],
+    },
+    /// Response: prover proves namespace membership.
+    Response {
+        /// BLAKE3(session_secret || nonce || prover_pubkey || verifier_pubkey)
+        proof: [u8; NAMESPACE_RESPONSE_LEN],
+    },
+    /// Both peers send challenges; responses are included together.
+    /// This enables mutual authentication in a single round-trip.
+    MutualChallenge {
+        /// Our challenge nonce for the peer.
+        our_nonce: [u8; NAMESPACE_CHALLENGE_LEN],
+        /// Response to peer's challenge (if we received one).
+        response_to_peer: Option<[u8; NAMESPACE_RESPONSE_LEN]>,
+    },
+    /// Authentication successful.
+    Authenticated,
+    /// Authentication failed or namespace mismatch.
+    Rejected { reason: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcRequest {
     DhtNode(DhtNodeRequest),
     Relay(RelayRequest),
     GossipSub(GossipSubRequest),
+    /// Namespace authentication (challenge-response).
+    /// Must complete before Plain requests are accepted.
+    NamespaceAuth(NamespaceAuth),
     Plain(Vec<u8>),
 }
 
@@ -306,6 +328,7 @@ impl RpcRequest {
             RpcRequest::Relay(relay_req) => Some(relay_req.sender_identity()),
             // These request types rely on TLS-verified identity
             RpcRequest::GossipSub(_) => None,
+            RpcRequest::NamespaceAuth(_) => None,
             RpcRequest::Plain(_) => None,
         }
     }
@@ -319,12 +342,16 @@ pub enum RpcResponse {
 
     GossipSubAck,
 
+    /// Response to namespace authentication.
+    NamespaceAuth(NamespaceAuth),
+
     /// Response to a plain request.
     Plain(Vec<u8>),
 
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -367,7 +394,6 @@ mod tests {
         Contact::single(test_identity(), "127.0.0.1:4433")
     }
 
-
     #[test]
     fn bounded_deserialization_normal_payloads() {
         let request = DhtNodeRequest::Store {
@@ -395,7 +421,8 @@ mod tests {
 
     #[test]
     fn response_deserialization() {
-        let response = DhtNodeResponse::Nodes(vec![Contact::single(make_identity(1), "127.0.0.1:8080")]);
+        let response =
+            DhtNodeResponse::Nodes(vec![Contact::single(make_identity(1), "127.0.0.1:8080")]);
         let bytes = bincode::serialize(&response).unwrap();
         assert!(test_deserialize_response(&bytes).is_ok());
     }
@@ -407,7 +434,9 @@ mod tests {
         let identity = keypair.identity();
 
         let requests = vec![
-            DhtNodeRequest::Ping { from: contact.clone() },
+            DhtNodeRequest::Ping {
+                from: contact.clone(),
+            },
             DhtNodeRequest::FindNode {
                 from: contact.clone(),
                 target: make_identity(2),
@@ -428,7 +457,7 @@ mod tests {
             let decoded = test_deserialize_request(&bytes).unwrap();
             let _ = format!("{:?}", decoded);
         }
-        
+
         let relay_request = RelayRequest::Connect {
             from_peer: identity,
             target_peer: identity,
@@ -443,7 +472,9 @@ mod tests {
     fn sender_identity_extraction() {
         let contact = Contact::single(make_identity(42), "127.0.0.1:8080");
 
-        let ping = DhtNodeRequest::Ping { from: contact.clone() };
+        let ping = DhtNodeRequest::Ping {
+            from: contact.clone(),
+        };
         assert_eq!(ping.sender_identity(), Some(make_identity(42)));
 
         let find_node = DhtNodeRequest::FindNode {
@@ -455,7 +486,7 @@ mod tests {
 
     #[test]
     fn content_addressing_integrity() {
-        use crate::dht::{classify_key_value_pair, ValueType};
+        use crate::dht::{ValueType, classify_key_value_pair};
 
         let data = b"original content";
         let key = *blake3::hash(data).as_bytes();
@@ -468,7 +499,7 @@ mod tests {
 
     #[test]
     fn empty_data_hashing() {
-        use crate::dht::{classify_key_value_pair, ValueType};
+        use crate::dht::{ValueType, classify_key_value_pair};
 
         let empty = b"";
         let key = *blake3::hash(empty).as_bytes();
@@ -487,10 +518,10 @@ mod tests {
 
         assert_ne!(hash1, hash2);
 
-        let data3 = b"data onf";        let hash3 = blake3::hash(data3);
+        let data3 = b"data onf";
+        let hash3 = blake3::hash(data3);
         assert_ne!(hash1, hash3);
     }
-
 
     #[test]
     fn gossipsub_message_variants() {
@@ -552,7 +583,6 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
-
 
     #[test]
     fn round_trip_dht_ping() {
@@ -638,18 +668,28 @@ mod tests {
 
     #[test]
     fn gossipsub_message_topic_accessor() {
-        let subscribe = GossipSubRequest::Subscribe { topic: "test".into() };
+        let subscribe = GossipSubRequest::Subscribe {
+            topic: "test".into(),
+        };
         assert_eq!(subscribe.topic(), Some("test"));
-        
-        let unsubscribe = GossipSubRequest::Unsubscribe { topic: "foo".into() };
+
+        let unsubscribe = GossipSubRequest::Unsubscribe {
+            topic: "foo".into(),
+        };
         assert_eq!(unsubscribe.topic(), Some("foo"));
-        
-        let graft = GossipSubRequest::Graft { topic: "bar".into() };
+
+        let graft = GossipSubRequest::Graft {
+            topic: "bar".into(),
+        };
         assert_eq!(graft.topic(), Some("bar"));
-        
-        let prune = GossipSubRequest::Prune { topic: "baz".into(), peers: vec![], backoff_secs: None };
+
+        let prune = GossipSubRequest::Prune {
+            topic: "baz".into(),
+            peers: vec![],
+            backoff_secs: None,
+        };
         assert_eq!(prune.topic(), Some("baz"));
-        
+
         let publish = GossipSubRequest::Publish {
             topic: "pub".into(),
             msg_id: [0u8; 32],
@@ -659,10 +699,13 @@ mod tests {
             signature: vec![],
         };
         assert_eq!(publish.topic(), Some("pub"));
-        
-        let ihave = GossipSubRequest::IHave { topic: "ih".into(), msg_ids: vec![] };
+
+        let ihave = GossipSubRequest::IHave {
+            topic: "ih".into(),
+            msg_ids: vec![],
+        };
         assert_eq!(ihave.topic(), Some("ih"));
-        
+
         let iwant = GossipSubRequest::IWant { msg_ids: vec![] };
         assert_eq!(iwant.topic(), None);
     }

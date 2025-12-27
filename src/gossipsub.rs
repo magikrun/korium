@@ -49,10 +49,10 @@ use lru::LruCache;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace, warn};
 
-use crate::crypto::{SignatureError, GOSSIPSUB_SIGNATURE_DOMAIN, verify_with_domain};
+use crate::crypto::{GOSSIPSUB_SIGNATURE_DOMAIN, SignatureError, verify_with_domain};
 use crate::dht::DhtNode;
 use crate::identity::{Contact, Identity, Keypair, Provenance};
-use crate::messages::{MessageId, GossipSubRequest};
+use crate::messages::{GossipSubRequest, MessageId};
 use crate::protocols::GossipSubRpc;
 use crate::rpc::RpcNode;
 
@@ -61,10 +61,10 @@ use crate::rpc::RpcNode;
 // ============================================================================
 
 /// A relay signal received through the GossipSub mesh.
-/// 
+///
 /// This is used for mesh-mediated signaling: relays can send connection
 /// notifications through mesh connections instead of dedicated signaling streams.
-/// 
+///
 /// SECURITY: Signals are cryptographically signed by from_peer to prevent forgery.
 #[derive(Debug, Clone)]
 pub struct RelaySignal {
@@ -130,8 +130,8 @@ pub const MAX_TOPICS: usize = 10_000;
 
 #[inline]
 pub fn is_valid_topic(topic: &str) -> bool {
-    !topic.is_empty() 
-        && topic.len() <= MAX_TOPIC_LENGTH 
+    !topic.is_empty()
+        && topic.len() <= MAX_TOPIC_LENGTH
         && topic.chars().all(|c| c.is_ascii_graphic() || c == ' ')
 }
 
@@ -240,16 +240,16 @@ pub const DEFAULT_P5_WEIGHT: f64 = 1.0;
 pub const DEFAULT_P6_WEIGHT: f64 = -10.0;
 
 /// Maximum P6 penalty before capping.
-/// 
+///
 /// SECURITY: P6 (IP colocation) is a *soft* signal for Sybil resistance, not proof
 /// of malicious behavior. It should degrade peer priority but NOT graylist peers
 /// on its own. Actual misbehavior (P4: invalid messages, P7: protocol violations)
 /// should be required for graylisting.
-/// 
+///
 /// This cap ensures P6 alone cannot exceed the graylist threshold (-100), allowing
 /// collocated peers (e.g., local development, data center deployments) to function
 /// while still being deprioritized relative to geographically diverse peers.
-/// 
+///
 /// Set to 90% of graylist threshold to leave headroom for accumulating positive scores.
 pub const MAX_P6_PENALTY: f64 = 90.0;
 
@@ -312,7 +312,7 @@ pub const DEFAULT_OPPORTUNISTIC_GRAFT_PEERS: usize = 2;
 pub const DEFAULT_PRUNE_BACKOFF_SECS: u64 = 60;
 
 /// GossipSub configuration.
-/// 
+///
 /// Contains all tunable parameters per the GossipSub v1.1 spec.
 /// Some fields may not be read internally but are exposed for library users
 /// to configure when building custom implementations.
@@ -321,7 +321,6 @@ pub struct GossipSubConfig {
     // ========================================================================
     // GossipSub v1.1 Mesh Parameters
     // ========================================================================
-    
     /// D - Target number of peers in the mesh per topic.
     pub mesh_n: usize,
     /// D_lo - Minimum mesh peers before grafting more.
@@ -341,15 +340,14 @@ pub struct GossipSubConfig {
     pub opportunistic_graft_threshold: f64,
     /// Number of peers to opportunistically graft per heartbeat.
     pub opportunistic_graft_peers: usize,
-    
+
     // ========================================================================
     // Peer Scoring Configuration (GossipSub v1.1)
     // ========================================================================
-    
+
     // NOTE: Peer scoring is always enabled for security. There is no opt-out.
     // GossipSub v1.1 peer scoring defends against grafting attacks, message
     // flooding, and mesh manipulation.
-    
     /// Score threshold below which we won't accept messages.
     pub graylist_threshold: f64,
     /// Score threshold below which we won't publish to peer.
@@ -360,11 +358,10 @@ pub struct GossipSubConfig {
     pub decay_interval: Duration,
     /// Threshold below which scores decay to exactly zero.
     pub decay_to_zero: f64,
-    
+
     // ========================================================================
     // Timing and Caching
     // ========================================================================
-    
     /// Timeout for IHave/IWant exchanges.
     pub ihave_timeout: Duration,
     /// Interval between heartbeat rounds (gossip emission, mesh maintenance).
@@ -373,11 +370,10 @@ pub struct GossipSubConfig {
     pub message_cache_size: usize,
     /// Time-to-live for cached messages.
     pub message_cache_ttl: Duration,
-    
+
     // ========================================================================
     // Size and Rate Limits
     // ========================================================================
-    
     /// Maximum message size in bytes.
     pub max_message_size: usize,
     /// Maximum IHave message IDs per notification.
@@ -401,20 +397,20 @@ impl Default for GossipSubConfig {
             prune_backoff: Duration::from_secs(DEFAULT_PRUNE_BACKOFF_SECS),
             opportunistic_graft_threshold: DEFAULT_OPPORTUNISTIC_GRAFT_THRESHOLD,
             opportunistic_graft_peers: DEFAULT_OPPORTUNISTIC_GRAFT_PEERS,
-            
+
             // Peer scoring thresholds (scoring is always enabled for security)
             graylist_threshold: DEFAULT_GRAYLIST_THRESHOLD,
             publish_threshold: DEFAULT_PUBLISH_THRESHOLD,
             gossip_threshold: DEFAULT_GOSSIP_THRESHOLD,
             decay_interval: DEFAULT_DECAY_INTERVAL,
             decay_to_zero: DEFAULT_DECAY_TO_ZERO,
-            
+
             // Timing and caching
             ihave_timeout: DEFAULT_IHAVE_TIMEOUT,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             message_cache_size: DEFAULT_MESSAGE_CACHE_SIZE,
             message_cache_ttl: DEFAULT_MESSAGE_CACHE_TTL,
-            
+
             // Size and rate limits
             max_message_size: MAX_MESSAGE_SIZE,
             max_ihave_length: DEFAULT_MAX_IHAVE_LENGTH,
@@ -429,14 +425,14 @@ impl Default for GossipSubConfig {
 // ============================================================================
 
 /// Topic-specific score parameters.
-/// 
+///
 /// Some fields may not be read internally but are exposed for library users
 /// to configure custom scoring policies.
 #[derive(Clone, Debug)]
 pub struct TopicScoreParams {
     /// Weight of this topic in overall peer score.
     pub topic_weight: f64,
-    
+
     // P1: Time in mesh
     /// Weight for time-in-mesh score component.
     pub time_in_mesh_weight: f64,
@@ -444,7 +440,7 @@ pub struct TopicScoreParams {
     pub time_in_mesh_quantum: Duration,
     /// Cap for time-in-mesh contribution.
     pub time_in_mesh_cap: f64,
-    
+
     // P2: First message deliveries
     /// Weight for first-message-deliveries score component.
     pub first_message_deliveries_weight: f64,
@@ -452,7 +448,7 @@ pub struct TopicScoreParams {
     pub first_message_deliveries_decay: f64,
     /// Cap for first message deliveries contribution.
     pub first_message_deliveries_cap: f64,
-    
+
     // P3: Mesh message delivery rate (optional, complex)
     /// Weight for mesh message delivery rate (0 = disabled).
     pub mesh_message_deliveries_weight: f64,
@@ -462,13 +458,13 @@ pub struct TopicScoreParams {
     pub mesh_message_deliveries_threshold: f64,
     /// Activation window for mesh delivery scoring.
     pub mesh_message_deliveries_activation: Duration,
-    
+
     // P3b: Mesh failure penalty
     /// Weight for mesh failure penalty (0 = disabled).
     pub mesh_failure_penalty_weight: f64,
     /// Decay for mesh failure penalty.
     pub mesh_failure_penalty_decay: f64,
-    
+
     // P4: Invalid messages
     /// Weight for invalid message score (should be negative).
     pub invalid_message_deliveries_weight: f64,
@@ -480,27 +476,27 @@ impl Default for TopicScoreParams {
     fn default() -> Self {
         Self {
             topic_weight: 1.0,
-            
+
             // P1: Time in mesh (simple, always on)
             time_in_mesh_weight: DEFAULT_P1_WEIGHT,
             time_in_mesh_quantum: DEFAULT_TIME_IN_MESH_QUANTUM,
             time_in_mesh_cap: DEFAULT_TIME_IN_MESH_CAP,
-            
+
             // P2: First message deliveries (simple, always on)
             first_message_deliveries_weight: DEFAULT_P2_WEIGHT,
             first_message_deliveries_decay: 0.5,
             first_message_deliveries_cap: DEFAULT_FIRST_MESSAGE_DELIVERIES_CAP,
-            
+
             // P3: Mesh delivery rate (disabled by default)
             mesh_message_deliveries_weight: DEFAULT_P3_WEIGHT,
             mesh_message_deliveries_decay: 0.5,
             mesh_message_deliveries_threshold: 1.0,
             mesh_message_deliveries_activation: Duration::from_secs(60),
-            
+
             // P3b: Mesh failure penalty (disabled by default)
             mesh_failure_penalty_weight: DEFAULT_P3B_WEIGHT,
             mesh_failure_penalty_decay: 0.5,
-            
+
             // P4: Invalid messages (always on, negative weight)
             invalid_message_deliveries_weight: DEFAULT_P4_WEIGHT,
             invalid_message_deliveries_decay: 0.5,
@@ -534,38 +530,37 @@ impl IpColocationTracker {
     fn new() -> Self {
         let prefix_cap = NonZeroUsize::new(MAX_COLOCATION_PREFIXES)
             .expect("MAX_COLOCATION_PREFIXES must be non-zero");
-        let peer_cap = NonZeroUsize::new(MAX_SCORED_PEERS)
-            .expect("MAX_SCORED_PEERS must be non-zero");
+        let peer_cap =
+            NonZeroUsize::new(MAX_SCORED_PEERS).expect("MAX_SCORED_PEERS must be non-zero");
         Self {
             prefix_counts: LruCache::new(prefix_cap),
             peer_prefixes: LruCache::new(peer_cap),
         }
     }
-    
+
     /// Register a peer's IP prefix, incrementing the colocation count.
     /// Returns the current count for that prefix (including this peer).
     fn register_peer(&mut self, peer: &Identity, provenance: Provenance) -> usize {
         // If peer already registered with different prefix, remove old
         if let Some(old_provenance) = self.peer_prefixes.get(peer) {
-            if *old_provenance != provenance {
-                self.unregister_peer(peer);
-            } else {
+            if *old_provenance == provenance {
                 // Same prefix, just return current count
                 return self.prefix_counts.get(&provenance).copied().unwrap_or(1);
             }
+            self.unregister_peer(peer);
         }
-        
+
         // Increment count for new prefix
         let count = self.prefix_counts.get_or_insert_mut(provenance, || 0);
         *count = count.saturating_add(1);
         let result = *count;
-        
+
         // Track peer -> prefix mapping
         self.peer_prefixes.put(*peer, provenance);
-        
+
         result
     }
-    
+
     /// Unregister a peer, decrementing their prefix's colocation count.
     fn unregister_peer(&mut self, peer: &Identity) {
         if let Some(prefix) = self.peer_prefixes.pop(peer)
@@ -575,16 +570,17 @@ impl IpColocationTracker {
             // Don't remove zero entries - LRU will handle cleanup
         }
     }
-    
+
     /// Get the colocation count for a peer's prefix.
     fn get_peer_count(&mut self, peer: &Identity) -> usize {
-        self.peer_prefixes.get(peer)
+        self.peer_prefixes
+            .get(peer)
             .and_then(|prefix| self.prefix_counts.get(prefix).copied())
             .unwrap_or(0)
     }
-    
+
     /// Calculate P6 penalty for a peer based on colocation count.
-    /// 
+    ///
     /// Formula: penalty = (count - threshold)² if count > threshold, else 0.
     fn calculate_p6_factor(&mut self, peer: &Identity) -> f64 {
         let count = self.get_peer_count(peer);
@@ -615,7 +611,7 @@ impl TopicScore {
     /// Calculate this topic's contribution to the peer score.
     fn calculate(&self, params: &TopicScoreParams) -> f64 {
         let mut score = 0.0;
-        
+
         // P1: Time in mesh
         if let Some(mesh_time) = self.mesh_time {
             let time_in_mesh = mesh_time.elapsed();
@@ -623,11 +619,13 @@ impl TopicScore {
                 .min(params.time_in_mesh_cap);
             score += params.time_in_mesh_weight * p1_value;
         }
-        
+
         // P2: First message deliveries
-        let p2_value = self.first_message_deliveries.min(params.first_message_deliveries_cap);
+        let p2_value = self
+            .first_message_deliveries
+            .min(params.first_message_deliveries_cap);
         score += params.first_message_deliveries_weight * p2_value;
-        
+
         // P3: Mesh message delivery rate (only if in mesh and activated)
         if let Some(mesh_time) = self.mesh_time
             && mesh_time.elapsed() >= params.mesh_message_deliveries_activation
@@ -639,18 +637,18 @@ impl TopicScore {
                 score += params.mesh_message_deliveries_weight * p3_value;
             }
         }
-        
+
         // P3b: Mesh failure penalty
         score += params.mesh_failure_penalty_weight * self.mesh_failure_penalty;
-        
+
         // P4: Invalid message deliveries (always negative contribution)
         let p4_value = self.invalid_message_deliveries * self.invalid_message_deliveries;
         score += params.invalid_message_deliveries_weight * p4_value;
-        
+
         // Apply topic weight
         params.topic_weight * score
     }
-    
+
     /// Apply decay to all counters.
     fn decay(&mut self, params: &TopicScoreParams) {
         self.first_message_deliveries *= params.first_message_deliveries_decay;
@@ -661,22 +659,22 @@ impl TopicScore {
 }
 
 /// Complete peer score state per GossipSub v1.1 spec.
-/// 
+///
 /// ## Implementation Status
-/// 
+///
 /// | Component | Status | Notes |
 /// |-----------|--------|-------|
 /// | P1-P4 | ✅ Implemented | Topic-specific scoring |
 /// | P5 | ✅ Implemented | Application-specific score |
 /// | P6 | ✅ Implemented | IP colocation via `IpColocationTracker` |
 /// | P7 | ✅ Implemented | Behavioural penalty |
-/// 
+///
 /// ## P6 IP Colocation Scoring
-/// 
+///
 /// P6 is computed externally by `IpColocationTracker` and passed to `calculate()`.
 /// This detects Sybil attacks from the same IP/subnet by applying a quadratic
 /// penalty when multiple peers share the same /16 IPv4 or /32 IPv6 prefix.
-/// 
+///
 /// The granularity is aligned with DHT's RTT tiering for consistency.
 #[derive(Debug, Clone)]
 struct PeerScore {
@@ -703,61 +701,61 @@ impl Default for PeerScore {
 
 impl PeerScore {
     /// Calculate the total peer score.
-    /// 
+    ///
     /// # Arguments
     /// * `topic_params` - Per-topic scoring parameters
     /// * `p6_factor` - IP colocation factor from `IpColocationTracker`
     fn calculate(&self, topic_params: &HashMap<String, TopicScoreParams>, p6_factor: f64) -> f64 {
         let mut score = 0.0;
-        
+
         // Sum topic-specific scores
         for (topic, topic_score) in &self.topic_scores {
             if let Some(params) = topic_params.get(topic) {
                 score += topic_score.calculate(params);
             }
         }
-        
+
         // P5: Application-specific score
         score += DEFAULT_P5_WEIGHT * self.app_specific_score;
-        
+
         // P6: IP colocation penalty (computed by IpColocationTracker)
         // SECURITY: Cap P6 penalty to MAX_P6_PENALTY to prevent graylisting from
         // IP colocation alone. This allows collocated peers (local dev, data centers)
         // to function while still being deprioritized.
         let p6_penalty = (DEFAULT_P6_WEIGHT * p6_factor).max(-MAX_P6_PENALTY);
         score += p6_penalty;
-        
+
         // P7: Behavioural penalty (squared)
         score += DEFAULT_P7_WEIGHT * self.behaviour_penalty * self.behaviour_penalty;
-        
+
         score
     }
-    
+
     /// Apply decay to all score components.
     fn decay(&mut self, topic_params: &HashMap<String, TopicScoreParams>, decay_to_zero: f64) {
-        for (topic, topic_score) in self.topic_scores.iter_mut() {
+        for (topic, topic_score) in &mut self.topic_scores {
             if let Some(params) = topic_params.get(topic) {
                 topic_score.decay(params);
             }
         }
-        
+
         // Decay behaviour penalty
         self.behaviour_penalty *= 0.99; // Fixed decay for P7
-        
+
         // Zero out very small values
         if self.behaviour_penalty.abs() < decay_to_zero {
             self.behaviour_penalty = 0.0;
         }
-        
+
         self.last_decay = Instant::now();
     }
-    
+
     /// Record joining mesh for a topic.
     fn mesh_joined(&mut self, topic: &str) {
         let topic_score = self.topic_scores.entry(topic.to_string()).or_default();
         topic_score.mesh_time = Some(Instant::now());
     }
-    
+
     /// Record leaving mesh for a topic.
     fn mesh_left(&mut self, topic: &str, params: &TopicScoreParams) {
         if let Some(topic_score) = self.topic_scores.get_mut(topic) {
@@ -766,8 +764,8 @@ impl PeerScore {
                 && mesh_time.elapsed() >= params.mesh_message_deliveries_activation
             {
                 // Below threshold at mesh exit = mesh failure penalty
-                let deficit = params.mesh_message_deliveries_threshold 
-                    - topic_score.mesh_message_deliveries;
+                let deficit =
+                    params.mesh_message_deliveries_threshold - topic_score.mesh_message_deliveries;
                 if deficit > 0.0 {
                     topic_score.mesh_failure_penalty += deficit * deficit;
                 }
@@ -776,13 +774,13 @@ impl PeerScore {
             topic_score.mesh_message_deliveries = 0.0;
         }
     }
-    
+
     /// Record first message delivery (P2).
     fn first_message_delivered(&mut self, topic: &str) {
         let topic_score = self.topic_scores.entry(topic.to_string()).or_default();
         topic_score.first_message_deliveries += 1.0;
     }
-    
+
     /// Record mesh message delivery (P3, only counts if in mesh).
     fn mesh_message_delivered(&mut self, topic: &str) {
         if let Some(topic_score) = self.topic_scores.get_mut(topic)
@@ -791,53 +789,57 @@ impl PeerScore {
             topic_score.mesh_message_deliveries += 1.0;
         }
     }
-    
+
     /// Record invalid message (P4).
     fn invalid_message(&mut self, topic: &str) {
         let topic_score = self.topic_scores.entry(topic.to_string()).or_default();
         topic_score.invalid_message_deliveries += 1.0;
     }
-    
+
     /// Add a behavioural penalty (P7).
     fn add_behaviour_penalty(&mut self, penalty: f64) {
         self.behaviour_penalty += penalty;
     }
 }
 
-
 // ============================================================================
 // GossipSub Message Signing
 // ============================================================================
 
 /// Build the payload that gets signed for a GossipSub message.
-/// 
+///
 /// This constructs the canonical byte representation that is signed.
 /// The actual signing uses domain separation via `crypto::sign_with_domain()`.
-/// 
+///
 /// Format: source(32) || topic_len(4) || topic || seqno(8) || data_len(4) || data
-fn build_gossipsub_signed_payload(source: &Identity, topic: &str, seqno: u64, data: &[u8]) -> Vec<u8> {
+fn build_gossipsub_signed_payload(
+    source: &Identity,
+    topic: &str,
+    seqno: u64,
+    data: &[u8],
+) -> Vec<u8> {
     let topic_bytes = topic.as_bytes();
     let mut payload = Vec::with_capacity(32 + 4 + topic_bytes.len() + 8 + 4 + data.len());
-    
+
     // Source identity (CRITICAL: prevents source spoofing)
     payload.extend_from_slice(source.as_bytes());
-    
+
     // Topic (length-prefixed)
     payload.extend_from_slice(&(topic_bytes.len() as u32).to_le_bytes());
     payload.extend_from_slice(topic_bytes);
-    
+
     // Sequence number
     payload.extend_from_slice(&seqno.to_le_bytes());
-    
+
     // Data payload (length-prefixed)
     payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
     payload.extend_from_slice(data);
-    
+
     payload
 }
 
 /// Sign a GossipSub message.
-/// 
+///
 /// Uses domain separation to prevent cross-protocol signature replay.
 fn sign_gossipsub_message(keypair: &Keypair, topic: &str, seqno: u64, data: &[u8]) -> Vec<u8> {
     let source = keypair.identity();
@@ -846,7 +848,7 @@ fn sign_gossipsub_message(keypair: &Keypair, topic: &str, seqno: u64, data: &[u8
 }
 
 /// Verify a GossipSub message signature.
-/// 
+///
 /// Uses domain separation to prevent cross-protocol signature replay.
 fn verify_gossipsub_signature(
     source: &Identity,
@@ -859,51 +861,65 @@ fn verify_gossipsub_signature(
     verify_with_domain(source, GOSSIPSUB_SIGNATURE_DOMAIN, &payload, signature)
 }
 
-
 // ============================================================================
 // RelaySignal Signing (mesh-mediated signaling)
 // ============================================================================
 
 /// Build the payload that gets signed for a RelaySignal message.
-/// 
-/// Format: target(32) || session_id(16) || relay_data_addr_len(4) || relay_data_addr
-/// 
-/// SECURITY: This binds the signal to the target peer and session, preventing
-/// an attacker from replaying signals to different targets or sessions.
+///
+/// Format: target(32) || session_id(16) || timestamp(8) || relay_data_addr_len(4) || relay_data_addr
+///
+/// SECURITY: This binds the signal to the target peer, session, and timestamp, preventing:
+/// - Replay to different targets (target identity in payload)
+/// - Cross-session replay (session_id in payload)
+/// - Indefinite replay of captured signals (timestamp prevents stale signals)
 fn build_relay_signal_signed_payload(
     target: &Identity,
     session_id: &[u8; 16],
     relay_data_addr: &str,
+    timestamp_ms: u64,
 ) -> Vec<u8> {
     let addr_bytes = relay_data_addr.as_bytes();
-    let mut payload = Vec::with_capacity(32 + 16 + 4 + addr_bytes.len());
-    
+    let mut payload = Vec::with_capacity(32 + 16 + 8 + 4 + addr_bytes.len());
+
     // Target identity (binds signal to specific recipient)
     payload.extend_from_slice(target.as_bytes());
-    
+
     // Session ID
     payload.extend_from_slice(session_id);
-    
+
+    // Timestamp for replay protection
+    // SECURITY HARDENING: Signals older than RELAY_SIGNAL_MAX_AGE_MS should be rejected
+    payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+
     // Relay data address (length-prefixed)
     payload.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
     payload.extend_from_slice(addr_bytes);
-    
+
     payload
 }
 
+/// Maximum age for relay signals before they're rejected (30 seconds).
+/// SECURITY: Limits replay window for captured signals.
+const RELAY_SIGNAL_MAX_AGE_MS: u64 = 30_000;
+
 /// Sign a RelaySignal for mesh-mediated signaling.
-/// 
+///
 /// Uses domain separation to prevent cross-protocol signature replay.
+/// Includes current timestamp for replay protection.
 fn sign_relay_signal(
     keypair: &Keypair,
     target: &Identity,
     session_id: &[u8; 16],
     relay_data_addr: &str,
-) -> Vec<u8> {
-    let payload = build_relay_signal_signed_payload(target, session_id, relay_data_addr);
-    crate::crypto::sign_with_domain(keypair, RELAY_SIGNAL_SIGNATURE_DOMAIN, &payload)
+) -> (Vec<u8>, u64) {
+    let timestamp_ms = crate::identity::now_ms();
+    let payload =
+        build_relay_signal_signed_payload(target, session_id, relay_data_addr, timestamp_ms);
+    let signature =
+        crate::crypto::sign_with_domain(keypair, RELAY_SIGNAL_SIGNATURE_DOMAIN, &payload);
+    (signature, timestamp_ms)
 }
-
 
 const MAX_PENDING_IWANTS: usize = 100;
 
@@ -923,19 +939,19 @@ impl SeqnoTracker {
             self.record_recent(seqno);
             return true;
         }
-        
+
         if self.recent_seqnos.contains(&seqno) {
             return false;
         }
-        
+
         if seqno + SEQNO_WINDOW_SIZE as u64 >= self.highest_seen {
             self.record_recent(seqno);
             return true;
         }
-        
+
         false
     }
-    
+
     fn record_recent(&mut self, seqno: u64) {
         if self.recent_seqnos.len() >= SEQNO_WINDOW_SIZE {
             self.recent_seqnos.pop_front();
@@ -959,20 +975,20 @@ impl IDontWantTracker {
         if self.entries.iter().any(|(id, _)| *id == msg_id) {
             return;
         }
-        
+
         // Enforce max entries limit by evicting oldest
         while self.entries.len() >= MAX_IDONTWANT_PER_PEER {
             self.entries.pop_front();
         }
-        
+
         self.entries.push_back((msg_id, Instant::now()));
     }
-    
+
     /// Check if the peer doesn't want a message.
     fn contains(&self, msg_id: &MessageId) -> bool {
         self.entries.iter().any(|(id, _)| id == msg_id)
     }
-    
+
     /// Remove expired entries (older than IDONTWANT_TTL).
     fn expire_old(&mut self) {
         let now = Instant::now();
@@ -1028,7 +1044,7 @@ impl PendingIWant {
             tried_peers: vec![peer],
         }
     }
-    
+
     /// Add a peer to tried list if not at capacity.
     /// Returns true if added, false if at MAX_IWANT_RETRY_PEERS limit.
     pub fn add_tried_peer(&mut self, peer: Identity) -> bool {
@@ -1038,7 +1054,7 @@ impl PendingIWant {
         self.tried_peers.push(peer);
         true
     }
-    
+
     /// Reset the request timestamp for retry.
     pub fn reset_timestamp(&mut self) {
         self.requested_at = Instant::now();
@@ -1068,7 +1084,7 @@ impl Default for TopicState {
             outbound_peers: HashSet::new(),
             recent_messages: VecDeque::new(),
             pending_iwants: LruCache::new(
-                NonZeroUsize::new(MAX_PENDING_IWANTS).expect("MAX_PENDING_IWANTS must be > 0")
+                NonZeroUsize::new(MAX_PENDING_IWANTS).expect("MAX_PENDING_IWANTS must be > 0"),
             ),
             last_lazy_push: Instant::now(),
         }
@@ -1089,14 +1105,19 @@ impl TopicState {
 
     /// Add a peer with enforcement of eager/lazy target limits.
     /// If eager count would exceed target, adds as lazy instead.
-    pub fn add_peer_with_limits(&mut self, peer: Identity, eager_target: usize, lazy_target: usize) -> bool {
+    pub fn add_peer_with_limits(
+        &mut self,
+        peer: Identity,
+        eager_target: usize,
+        lazy_target: usize,
+    ) -> bool {
         if self.contains(&peer) {
             return true; // Already present
         }
         if self.total_peers() >= MAX_PEERS_PER_TOPIC {
             return false;
         }
-        
+
         // Add as eager if under target, otherwise as lazy
         if self.eager_peers.len() < eager_target {
             self.eager_peers.insert(peer);
@@ -1125,11 +1146,11 @@ impl TopicState {
     pub fn promote_to_eager_with_limit(&mut self, peer: Identity, eager_target: usize) {
         let was_lazy = self.lazy_peers.remove(&peer);
         let is_eager = self.eager_peers.contains(&peer);
-        
+
         if is_eager {
             return; // Already eager
         }
-        
+
         if self.eager_peers.len() < eager_target {
             // Under target, promote to eager
             self.eager_peers.insert(peer);
@@ -1180,27 +1201,31 @@ impl TopicState {
         if self.pending_iwants.contains(&msg_id) {
             return 0;
         }
-        
+
         // Check if we're at capacity - LruCache will evict, but we need to track for global count
         let will_evict = self.pending_iwants.len() >= MAX_PENDING_IWANTS;
-        
+
         // LruCache::put automatically evicts LRU entry when at capacity
         self.pending_iwants.put(msg_id, PendingIWant::new(peer));
-        
+
         // Return delta: +1 for new entry, but if we evicted, net is 0
-        if will_evict { 0 } else { 1 }
+        i32::from(!will_evict)
     }
 
     /// Check for timed out IWant requests and retry with different peers.
     /// Returns (retries, completed_count) where completed_count is the number of
     /// IWants that exhausted all retry options and were removed.
-    pub fn check_iwant_timeouts(&mut self, ihave_timeout: Duration) -> (Vec<(MessageId, Identity)>, usize) {
+    pub fn check_iwant_timeouts(
+        &mut self,
+        ihave_timeout: Duration,
+    ) -> (Vec<(MessageId, Identity)>, usize) {
         let now = Instant::now();
         let mut retries = Vec::new();
         let mut completed = Vec::new();
 
         // Collect data first to avoid borrow conflicts with LruCache
-        let entries: Vec<(MessageId, Instant, Vec<Identity>)> = self.pending_iwants
+        let entries: Vec<(MessageId, Instant, Vec<Identity>)> = self
+            .pending_iwants
             .iter()
             .map(|(id, pending)| (*id, pending.requested_at, pending.tried_peers.clone()))
             .collect();
@@ -1208,7 +1233,9 @@ impl TopicState {
         for (msg_id, requested_at, tried_peers) in entries {
             if now.duration_since(requested_at) > ihave_timeout {
                 // Find a lazy peer we haven't tried yet
-                if let Some(next_peer) = self.lazy_peers.iter()
+                if let Some(next_peer) = self
+                    .lazy_peers
+                    .iter()
                     .find(|p| !tried_peers.contains(p))
                     .copied()
                 {
@@ -1265,11 +1292,11 @@ impl PeerRateLimit {
     pub fn check_and_record(&mut self, max_rate: usize) -> bool {
         self.check_and_record_generic(&mut self.publish_times.clone(), max_rate)
     }
-    
+
     pub fn check_and_record_iwant(&mut self, max_rate: usize) -> bool {
         let now = Instant::now();
         self.last_active = now;
-        
+
         while let Some(front) = self.iwant_times.front() {
             if now.duration_since(*front) > RATE_LIMIT_WINDOW {
                 self.iwant_times.pop_front();
@@ -1277,19 +1304,23 @@ impl PeerRateLimit {
                 break;
             }
         }
-        
+
         if self.iwant_times.len() >= max_rate {
             return true;
         }
-        
+
         self.iwant_times.push_back(now);
         false
     }
-    
-    fn check_and_record_generic(&mut self, _times: &mut VecDeque<Instant>, max_rate: usize) -> bool {
+
+    fn check_and_record_generic(
+        &mut self,
+        _times: &mut VecDeque<Instant>,
+        max_rate: usize,
+    ) -> bool {
         let now = Instant::now();
         self.last_active = now;
-        
+
         while let Some(front) = self.publish_times.front() {
             if now.duration_since(*front) > RATE_LIMIT_WINDOW {
                 self.publish_times.pop_front();
@@ -1297,18 +1328,18 @@ impl PeerRateLimit {
                 break;
             }
         }
-        
+
         if self.publish_times.len() >= max_rate {
             return true;
         }
-        
+
         self.publish_times.push_back(now);
         false
     }
 }
 
 /// Structured error type for message publication failures.
-/// 
+///
 /// Used by `GossipSub::publish()` to indicate why a message was rejected.
 /// Callers can match on this to handle specific rejection reasons programmatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1328,14 +1359,16 @@ impl std::fmt::Display for MessageRejection {
         match self {
             Self::MessageTooLarge => write!(f, "message size exceeds maximum allowed"),
             Self::TopicTooLong => write!(f, "topic name exceeds maximum length"),
-            Self::InvalidTopic => write!(f, "topic name is invalid (empty or contains non-ASCII characters)"),
+            Self::InvalidTopic => write!(
+                f,
+                "topic name is invalid (empty or contains non-ASCII characters)"
+            ),
             Self::RateLimited => write!(f, "local publish rate limit exceeded"),
         }
     }
 }
 
 impl std::error::Error for MessageRejection {}
-
 
 // ============================================================================
 // Commands sent from Handle to Actor
@@ -1345,7 +1378,11 @@ enum Command {
     Subscribe(String, oneshot::Sender<anyhow::Result<()>>),
     Unsubscribe(String, oneshot::Sender<anyhow::Result<()>>),
     Publish(String, Vec<u8>, oneshot::Sender<anyhow::Result<MessageId>>),
-    HandleMessage(Contact, GossipSubRequest, oneshot::Sender<anyhow::Result<()>>),
+    HandleMessage(
+        Contact,
+        GossipSubRequest,
+        oneshot::Sender<anyhow::Result<()>>,
+    ),
     GetSubscriptions(oneshot::Sender<Vec<String>>),
     /// Get all mesh peer contacts (for relay discovery).
     GetMeshPeers(oneshot::Sender<Vec<Contact>>),
@@ -1360,7 +1397,6 @@ enum Command {
     Quit,
 }
 
-
 // ============================================================================
 // GossipSub Handle (public API - cheap to clone)
 // ============================================================================
@@ -1374,11 +1410,11 @@ pub struct GossipSub<N: GossipSubRpc> {
 
 impl<N: GossipSubRpc + Send + Sync + 'static> GossipSub<N> {
     /// Spawn GossipSub with DHT integration and mesh relay signaling.
-    /// 
+    ///
     /// DHT integration provides:
     /// - Mesh peer contact notification (refreshes routing table)
     /// - Unknown peer resolution via DHT lookup
-    /// 
+    ///
     /// Relay signaling provides:
     /// - RelaySignal messages addressed to us forwarded through channel
     /// - Mesh-mediated signaling for relay connections
@@ -1391,10 +1427,17 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSub<N> {
     ) -> (Self, mpsc::Receiver<ReceivedMessage>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(1000);
         let (msg_tx, msg_rx) = mpsc::channel(1000);
-        
-        let actor = GossipSubActor::new(network, keypair, config, msg_tx, Some(dht), Some(relay_signal_tx));
+
+        let actor = GossipSubActor::new(
+            network,
+            keypair,
+            config,
+            msg_tx,
+            Some(dht),
+            Some(relay_signal_tx),
+        );
         tokio::spawn(actor.run(cmd_rx));
-        
+
         (
             Self {
                 cmd_tx,
@@ -1406,35 +1449,49 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSub<N> {
 
     pub async fn subscribe(&self, topic: &str) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::Subscribe(topic.to_string(), tx)).await
+        self.cmd_tx
+            .send(Command::Subscribe(topic.to_string(), tx))
+            .await
             .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
     }
 
     pub async fn unsubscribe(&self, topic: &str) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::Unsubscribe(topic.to_string(), tx)).await
+        self.cmd_tx
+            .send(Command::Unsubscribe(topic.to_string(), tx))
+            .await
             .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
     }
 
     pub async fn publish(&self, topic: &str, data: Vec<u8>) -> anyhow::Result<MessageId> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::Publish(topic.to_string(), data, tx)).await
+        self.cmd_tx
+            .send(Command::Publish(topic.to_string(), data, tx))
+            .await
             .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
     }
 
     pub async fn subscriptions(&self) -> Vec<String> {
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::GetSubscriptions(tx)).await.is_err() {
+        if self
+            .cmd_tx
+            .send(Command::GetSubscriptions(tx))
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
     }
 
     /// Get all unique mesh peer contacts across all subscribed topics.
-    /// 
+    ///
     /// This is useful for relay discovery: mesh peers are pre-connected,
     /// pre-authenticated, and RTT-known, making them ideal relay candidates.
     pub async fn mesh_peers(&self) -> Vec<Contact> {
@@ -1450,17 +1507,17 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSub<N> {
     }
 
     /// Send a relay signal to a target peer via the GossipSub mesh.
-    /// 
+    ///
     /// This enables mesh-mediated signaling: instead of maintaining dedicated
     /// signaling connections, relay signals can be forwarded through existing
     /// mesh connections. The target must be reachable via mesh peers.
-    /// 
+    ///
     /// # Arguments
     /// * `target` - Identity of the peer to receive the signal
     /// * `from_peer` - Identity of the connecting peer (initiator)
     /// * `session_id` - Relay session identifier
     /// * `relay_data_addr` - Address for relay data packets
-    /// 
+    ///
     /// # Security
     /// - Only forwards to mesh peers (no gossip flooding)
     /// - Target must be directly connected or one hop away
@@ -1472,25 +1529,35 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSub<N> {
         relay_data_addr: String,
     ) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::SendRelaySignal {
-            target,
-            from_peer,
-            session_id,
-            relay_data_addr,
-            reply: tx,
-        }).await.map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
+        self.cmd_tx
+            .send(Command::SendRelaySignal {
+                target,
+                from_peer,
+                session_id,
+                relay_data_addr,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
     }
 
     /// Handle an incoming GossipSub message from a peer.
-    pub async fn handle_message(&self, from: &Contact, message: GossipSubRequest) -> anyhow::Result<()> {
+    pub async fn handle_message(
+        &self,
+        from: &Contact,
+        message: GossipSubRequest,
+    ) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::HandleMessage(from.clone(), message, tx)).await
+        self.cmd_tx
+            .send(Command::HandleMessage(from.clone(), message, tx))
+            .await
             .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("GossipSub actor closed"))?
     }
 }
-
 
 // ============================================================================
 // GossipSub Actor (owns state)
@@ -1564,21 +1631,21 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         let cache_size = NonZeroUsize::new(config.message_cache_size)
             .unwrap_or(NonZeroUsize::new(1).expect("1 is non-zero"));
         let local_identity = keypair.identity();
-        
+
         // SECURITY: Bounded LRU caches to prevent memory exhaustion attacks
         let seqno_tracker_cap = NonZeroUsize::new(MAX_SEQNO_TRACKING_SOURCES)
             .expect("MAX_SEQNO_TRACKING_SOURCES must be non-zero");
         let rate_limits_cap = NonZeroUsize::new(MAX_RATE_LIMIT_ENTRIES)
             .expect("MAX_RATE_LIMIT_ENTRIES must be non-zero");
-        let contacts_cap = NonZeroUsize::new(MAX_KNOWN_PEERS)
-            .expect("MAX_KNOWN_PEERS must be non-zero");
-        let peer_scores_cap = NonZeroUsize::new(MAX_SCORED_PEERS)
-            .expect("MAX_SCORED_PEERS must be non-zero");
-        let backoff_cap = NonZeroUsize::new(MAX_BACKOFF_ENTRIES)
-            .expect("MAX_BACKOFF_ENTRIES must be non-zero");
-        let idontwant_cap = NonZeroUsize::new(MAX_IDONTWANT_PEERS)
-            .expect("MAX_IDONTWANT_PEERS must be non-zero");
-        
+        let contacts_cap =
+            NonZeroUsize::new(MAX_KNOWN_PEERS).expect("MAX_KNOWN_PEERS must be non-zero");
+        let peer_scores_cap =
+            NonZeroUsize::new(MAX_SCORED_PEERS).expect("MAX_SCORED_PEERS must be non-zero");
+        let backoff_cap =
+            NonZeroUsize::new(MAX_BACKOFF_ENTRIES).expect("MAX_BACKOFF_ENTRIES must be non-zero");
+        let idontwant_cap =
+            NonZeroUsize::new(MAX_IDONTWANT_PEERS).expect("MAX_IDONTWANT_PEERS must be non-zero");
+
         Self {
             network,
             keypair,
@@ -1615,19 +1682,20 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     fn store_contact(&mut self, contact: Contact) {
         // Extract provenance from contact's primary address for P6 colocation scoring
         if let Some(provenance) = contact.provenance() {
-            self.ip_colocation.register_peer(&contact.identity, provenance);
+            self.ip_colocation
+                .register_peer(&contact.identity, provenance);
         }
         self.contacts.put(contact.identity, contact);
     }
 
     /// Get all unique mesh peer contacts across all subscribed topics.
-    /// 
+    ///
     /// Used by relay discovery: mesh peers are pre-connected and RTT-known,
     /// making them ideal relay candidates.
     fn get_mesh_peer_contacts(&mut self) -> Vec<Contact> {
         let mut seen = HashSet::new();
         let mut contacts = Vec::new();
-        
+
         for state in self.topics.values() {
             // Collect from eager peers (active mesh)
             for peer_id in &state.eager_peers {
@@ -1646,7 +1714,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 }
             }
         }
-        
+
         contacts
     }
 
@@ -1658,7 +1726,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     fn get_peer_score(&mut self, peer: &Identity) -> f64 {
         // Calculate P6 factor from colocation tracker
         let p6_factor = self.ip_colocation.calculate_p6_factor(peer);
-        
+
         if let Some(score) = self.peer_scores.get(peer) {
             score.calculate(&self.topic_score_params, p6_factor)
         } else {
@@ -1689,13 +1757,17 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Record that a peer joined the mesh for a topic.
     fn score_mesh_joined(&mut self, peer: &Identity, topic: &str) {
-        let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
+        let score = self
+            .peer_scores
+            .get_or_insert_mut(*peer, PeerScore::default);
         score.mesh_joined(topic);
     }
 
     /// Record that a peer left the mesh for a topic.
     fn score_mesh_left(&mut self, peer: &Identity, topic: &str) {
-        let params = self.topic_score_params.get(topic)
+        let params = self
+            .topic_score_params
+            .get(topic)
             .cloned()
             .unwrap_or_default();
         if let Some(score) = self.peer_scores.get_mut(peer) {
@@ -1705,20 +1777,26 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Record a first message delivery from a peer.
     fn score_first_message_delivered(&mut self, peer: &Identity, topic: &str) {
-        let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
+        let score = self
+            .peer_scores
+            .get_or_insert_mut(*peer, PeerScore::default);
         score.first_message_delivered(topic);
         score.mesh_message_delivered(topic);
     }
 
     /// Record an invalid message from a peer.
     fn score_invalid_message(&mut self, peer: &Identity, topic: &str) {
-        let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
+        let score = self
+            .peer_scores
+            .get_or_insert_mut(*peer, PeerScore::default);
         score.invalid_message(topic);
     }
 
     /// Add a behavioural penalty to a peer (P7).
     fn score_add_penalty(&mut self, peer: &Identity, penalty: f64) {
-        let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
+        let score = self
+            .peer_scores
+            .get_or_insert_mut(*peer, PeerScore::default);
         score.add_behaviour_penalty(penalty);
     }
 
@@ -1727,16 +1805,16 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         if self.last_score_decay.elapsed() < self.config.decay_interval {
             return;
         }
-        
+
         // Collect peer IDs to avoid borrow conflict
         let peers: Vec<Identity> = self.peer_scores.iter().map(|(id, _)| *id).collect();
-        
+
         for peer in peers {
             if let Some(score) = self.peer_scores.get_mut(&peer) {
                 score.decay(&self.topic_score_params, self.config.decay_to_zero);
             }
         }
-        
+
         self.last_score_decay = Instant::now();
     }
 
@@ -1748,13 +1826,12 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     /// Per GossipSub v1.1: must not GRAFT to peer during backoff.
     fn record_backoff(&mut self, peer: &Identity, topic: &str, backoff_secs: Option<u64>) {
         let backoff_duration = backoff_secs
-            .map(Duration::from_secs)
-            .unwrap_or(self.config.prune_backoff);
-        
+            .map_or(self.config.prune_backoff, Duration::from_secs);
+
         let expiry = Instant::now() + backoff_duration;
         let key = (*peer, topic.to_string());
         self.prune_backoff.put(key, expiry);
-        
+
         trace!(
             peer = %hex::encode(&peer.as_bytes()[..8]),
             topic = %topic,
@@ -1779,14 +1856,15 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     /// Clean up expired backoff entries (called from heartbeat).
     fn cleanup_backoff(&mut self) {
         let now = Instant::now();
-        
+
         // Collect expired keys to avoid borrow issues
-        let expired_keys: Vec<BackoffKey> = self.prune_backoff
+        let expired_keys: Vec<BackoffKey> = self
+            .prune_backoff
             .iter()
             .filter(|(_, expiry)| now >= **expiry)
             .map(|(key, _)| key.clone())
             .collect();
-        
+
         for key in expired_keys {
             self.prune_backoff.pop(&key);
         }
@@ -1801,10 +1879,15 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Get peer suggestions for peer exchange when sending PRUNE.
     /// Returns other mesh peers that the pruned peer could connect to.
-    fn get_peer_exchange_suggestions(&mut self, topic: &str, exclude_peer: &Identity) -> Vec<Identity> {
+    fn get_peer_exchange_suggestions(
+        &mut self,
+        topic: &str,
+        exclude_peer: &Identity,
+    ) -> Vec<Identity> {
         // Collect candidate peers first to avoid borrow conflicts
         let candidates: Vec<Identity> = if let Some(state) = self.topics.get(topic) {
-            state.eager_peers
+            state
+                .eager_peers
                 .iter()
                 .filter(|p| **p != *exclude_peer && **p != self.local_identity)
                 .take(Self::MAX_PX_PEERS * 2) // Take extra in case some have negative scores
@@ -1813,7 +1896,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         } else {
             Vec::new()
         };
-        
+
         // Now filter by score
         let mut suggestions = Vec::new();
         for peer in candidates {
@@ -1825,36 +1908,40 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 break;
             }
         }
-        
+
         suggestions
     }
 
     /// Send a GossipSub message to a peer by identity.
     /// Returns Ok if sent, Err if contact not known.
     /// Also records RTT to DHT tiering if DHT is available.
-    async fn send_to_peer(&mut self, to: &Identity, message: GossipSubRequest) -> anyhow::Result<()> {
+    async fn send_to_peer(
+        &mut self,
+        to: &Identity,
+        message: GossipSubRequest,
+    ) -> anyhow::Result<()> {
         let contact = match self.get_contact(to) {
             Some(c) => c.clone(),
             None => anyhow::bail!("no contact for peer {}", hex::encode(&to.as_bytes()[..8])),
         };
-        
+
         let start = Instant::now();
         let result = self.network.send_gossipsub(&contact, message).await;
         let elapsed = start.elapsed();
-        
+
         // Report RTT to DHT tiering (fire-and-forget, only on success)
         if result.is_ok()
             && let Some(dht) = &self.dht
         {
             dht.record_rtt(&contact, elapsed).await;
         }
-        
+
         result
     }
 
     async fn run(mut self, mut cmd_rx: mpsc::Receiver<Command>) {
         let mut heartbeat_interval = tokio::time::interval(self.config.heartbeat_interval);
-        
+
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -1905,7 +1992,11 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     async fn handle_subscribe_cmd(&mut self, topic: &str) -> anyhow::Result<()> {
         if topic.len() > MAX_TOPIC_LENGTH {
-            anyhow::bail!("topic length {} exceeds maximum {}", topic.len(), MAX_TOPIC_LENGTH);
+            anyhow::bail!(
+                "topic length {} exceeds maximum {}",
+                topic.len(),
+                MAX_TOPIC_LENGTH
+            );
         }
         if topic.is_empty() {
             anyhow::bail!("topic name cannot be empty");
@@ -1918,54 +2009,71 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             return Ok(());
         }
         if self.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_PEER {
-            anyhow::bail!("subscription limit reached (max {})", MAX_SUBSCRIPTIONS_PER_PEER);
+            anyhow::bail!(
+                "subscription limit reached (max {MAX_SUBSCRIPTIONS_PER_PEER})"
+            );
         }
         self.subscriptions.insert(topic.to_string());
 
         if !self.topics.contains_key(topic) && self.topics.len() >= MAX_TOPICS {
-            let empty = self.topics.iter()
+            let empty = self
+                .topics
+                .iter()
                 .find(|(_, s)| s.eager_peers.is_empty() && s.lazy_peers.is_empty())
                 .map(|(t, _)| t.clone());
             if let Some(t) = empty {
                 // SECURITY: Subtract pending IWants before dropping TopicState to prevent
                 // global_pending_iwants from drifting.
                 if let Some(evicted_state) = self.topics.remove(&t) {
-                    self.global_pending_iwants = self.global_pending_iwants
+                    self.global_pending_iwants = self
+                        .global_pending_iwants
                         .saturating_sub(evicted_state.pending_iwants.len());
                 }
                 debug!(evicted_topic = %t, new_topic = %topic, "evicted empty topic to make room");
             } else {
                 self.subscriptions.remove(topic);
-                anyhow::bail!("topic limit reached (max {})", MAX_TOPICS);
+                anyhow::bail!("topic limit reached (max {MAX_TOPICS})");
             }
         }
 
         // Create topic state and add known contacts
         let state = self.topics.entry(topic.to_string()).or_default();
-        
-        for (peer, _) in self.contacts.iter() {
+
+        for (peer, _) in &self.contacts {
             if *peer != self.local_identity {
                 state.add_peer_with_limits(*peer, self.config.mesh_n, self.config.gossip_lazy);
             }
         }
-        
+
         // Check if we need DHT bootstrap (capture before releasing borrow)
         let needs_bootstrap = state.eager_peers.is_empty() && state.lazy_peers.is_empty();
-        
+
         // DHT bootstrap: if no peers known for this topic, discover via DHT
         if needs_bootstrap {
             self.bootstrap_mesh_from_dht(topic).await;
         }
 
         // Re-borrow to get final peer list
-        let peers: Vec<Identity> = self.topics.get(topic)
-            .map(|s| s.eager_peers.iter().chain(s.lazy_peers.iter()).copied().collect())
+        let peers: Vec<Identity> = self
+            .topics
+            .get(topic)
+            .map(|s| {
+                s.eager_peers
+                    .iter()
+                    .chain(s.lazy_peers.iter())
+                    .copied()
+                    .collect()
+            })
             .unwrap_or_default();
 
         for peer in peers {
-            self.queue_message(&peer, GossipSubRequest::Subscribe {
-                topic: topic.to_string(),
-            }).await;
+            self.queue_message(
+                &peer,
+                GossipSubRequest::Subscribe {
+                    topic: topic.to_string(),
+                },
+            )
+            .await;
         }
 
         debug!(topic = %topic, "subscribed to topic (GossipSub)");
@@ -1980,10 +2088,13 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         let all_peers: Vec<Identity> = if let Some(state) = self.topics.remove(topic) {
             // SECURITY: Subtract pending IWants before dropping TopicState to prevent
             // global_pending_iwants from drifting (counter would stay elevated otherwise).
-            self.global_pending_iwants = self.global_pending_iwants
+            self.global_pending_iwants = self
+                .global_pending_iwants
                 .saturating_sub(state.pending_iwants.len());
-            
-            state.eager_peers.into_iter()
+
+            state
+                .eager_peers
+                .into_iter()
                 .chain(state.lazy_peers.into_iter())
                 .collect()
         } else {
@@ -1991,21 +2102,29 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         };
 
         for peer in all_peers {
-            self.queue_message(&peer, GossipSubRequest::Unsubscribe {
-                topic: topic.to_string(),
-            }).await;
+            self.queue_message(
+                &peer,
+                GossipSubRequest::Unsubscribe {
+                    topic: topic.to_string(),
+                },
+            )
+            .await;
         }
 
         debug!(topic = %topic, "unsubscribed from topic");
         Ok(())
     }
 
-    async fn handle_publish_cmd(&mut self, topic: &str, data: Vec<u8>) -> anyhow::Result<MessageId> {
+    async fn handle_publish_cmd(
+        &mut self,
+        topic: &str,
+        data: Vec<u8>,
+    ) -> anyhow::Result<MessageId> {
         // Validate message size
         if data.len() > self.config.max_message_size {
             return Err(MessageRejection::MessageTooLarge.into());
         }
-        
+
         // Validate topic name
         if topic.len() > MAX_TOPIC_LENGTH {
             return Err(MessageRejection::TopicTooLong.into());
@@ -2016,7 +2135,9 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
         // Check local publish rate limit
         {
-            let limiter = self.rate_limits.get_or_insert_mut(self.local_identity, PeerRateLimit::default);
+            let limiter = self
+                .rate_limits
+                .get_or_insert_mut(self.local_identity, PeerRateLimit::default);
             if limiter.check_and_record(self.config.publish_rate_limit) {
                 return Err(MessageRejection::RateLimited.into());
             }
@@ -2024,23 +2145,26 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
         self.seqno = self.seqno.wrapping_add(1);
         let seqno = self.seqno;
-        
+
         let signature = sign_gossipsub_message(&self.keypair, topic, seqno, &data);
-        
+
         let mut id_input = Vec::new();
         id_input.extend_from_slice(self.local_identity.as_bytes());
         id_input.extend_from_slice(&seqno.to_le_bytes());
         id_input.extend_from_slice(&data);
         let msg_id = *hash(&id_input).as_bytes();
 
-        self.cache_message(msg_id, CachedMessage {
-            topic: topic.to_string(),
-            source: self.local_identity,
-            seqno,
-            data: data.clone(),
-            signature: signature.clone(),
-            cached_at: Instant::now(),
-        });
+        self.cache_message(
+            msg_id,
+            CachedMessage {
+                topic: topic.to_string(),
+                source: self.local_identity,
+                seqno,
+                data: data.clone(),
+                signature: signature.clone(),
+                cached_at: Instant::now(),
+            },
+        );
 
         if let Some(state) = self.topics.get_mut(topic) {
             state.recent_messages.push_back(msg_id);
@@ -2060,23 +2184,27 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
         // GossipSub v1.1 Flood Publishing: Send to ALL peers above publish_threshold,
         // not just mesh peers. This improves reliability in volatile networks.
-        // 
+        //
         // Collect mesh peers (eager) and non-mesh peers (lazy) separately
-        let (eager_peers, lazy_peers): (Vec<Identity>, Vec<Identity>) = self.topics.get(topic)
-            .map(|s| (
-                s.eager_peers.iter().copied().collect(),
-                s.lazy_peers.iter().copied().collect()
-            ))
+        let (eager_peers, lazy_peers): (Vec<Identity>, Vec<Identity>) = self
+            .topics
+            .get(topic)
+            .map(|s| {
+                (
+                    s.eager_peers.iter().copied().collect(),
+                    s.lazy_peers.iter().copied().collect(),
+                )
+            })
             .unwrap_or_default();
 
         let mut flood_count = 0usize;
-        
+
         // Always send to mesh peers (eager)
         for peer in &eager_peers {
             self.queue_message(peer, publish_msg.clone()).await;
             flood_count += 1;
         }
-        
+
         // Flood Publishing: Also send to non-mesh peers above publish_threshold
         for peer in lazy_peers {
             if !self.is_peer_below_publish_threshold(&peer) {
@@ -2100,13 +2228,17 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         Ok(msg_id)
     }
 
-    async fn handle_message_internal(&mut self, from: &Identity, msg: GossipSubRequest) -> anyhow::Result<()> {
+    async fn handle_message_internal(
+        &mut self,
+        from: &Identity,
+        msg: GossipSubRequest,
+    ) -> anyhow::Result<()> {
         if let Some(topic) = msg.topic()
             && !is_valid_topic(topic)
         {
             anyhow::bail!("invalid topic name from peer");
         }
-        
+
         match msg {
             GossipSubRequest::Subscribe { topic } => {
                 self.handle_subscribe(from, &topic).await;
@@ -2117,11 +2249,23 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             GossipSubRequest::Graft { topic } => {
                 self.handle_graft(from, &topic).await;
             }
-            GossipSubRequest::Prune { topic, peers, backoff_secs } => {
+            GossipSubRequest::Prune {
+                topic,
+                peers,
+                backoff_secs,
+            } => {
                 self.handle_prune(from, &topic, peers, backoff_secs).await;
             }
-            GossipSubRequest::Publish { topic, msg_id, source, seqno, data, signature } => {
-                self.handle_publish(from, &topic, msg_id, source, seqno, data, signature).await?;
+            GossipSubRequest::Publish {
+                topic,
+                msg_id,
+                source,
+                seqno,
+                data,
+                signature,
+            } => {
+                self.handle_publish(from, &topic, msg_id, source, seqno, data, signature)
+                    .await?;
             }
             GossipSubRequest::IHave { topic, msg_ids } => {
                 self.handle_ihave(from, &topic, msg_ids).await;
@@ -2132,8 +2276,24 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             GossipSubRequest::IDontWant { msg_ids } => {
                 self.handle_idontwant(from, msg_ids);
             }
-            GossipSubRequest::RelaySignal { target, from_peer, session_id, relay_data_addr, signature } => {
-                self.handle_relay_signal(from, target, from_peer, session_id, relay_data_addr, signature).await;
+            GossipSubRequest::RelaySignal {
+                target,
+                from_peer,
+                session_id,
+                relay_data_addr,
+                timestamp_ms,
+                signature,
+            } => {
+                self.handle_relay_signal(
+                    from,
+                    target,
+                    from_peer,
+                    session_id,
+                    relay_data_addr,
+                    timestamp_ms,
+                    signature,
+                )
+                .await;
             }
         }
         Ok(())
@@ -2141,14 +2301,20 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     fn cache_message(&mut self, msg_id: MessageId, message: CachedMessage) {
         let message_size = message.size_bytes();
-        
+
         if let Some(existing) = self.message_cache.peek(&msg_id) {
-            self.message_cache_bytes = self.message_cache_bytes.saturating_sub(existing.size_bytes());
+            self.message_cache_bytes = self
+                .message_cache_bytes
+                .saturating_sub(existing.size_bytes());
         }
-        
-        while self.message_cache_bytes + message_size > MAX_MESSAGE_CACHE_BYTES && !self.message_cache.is_empty() {
+
+        while self.message_cache_bytes + message_size > MAX_MESSAGE_CACHE_BYTES
+            && !self.message_cache.is_empty()
+        {
             if let Some((_, evicted)) = self.message_cache.pop_lru() {
-                self.message_cache_bytes = self.message_cache_bytes.saturating_sub(evicted.size_bytes());
+                self.message_cache_bytes = self
+                    .message_cache_bytes
+                    .saturating_sub(evicted.size_bytes());
                 trace!(
                     evicted_bytes = evicted.size_bytes(),
                     cache_bytes = self.message_cache_bytes,
@@ -2158,16 +2324,16 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 break;
             }
         }
-        
+
         self.message_cache.put(msg_id, message);
         self.message_cache_bytes = self.message_cache_bytes.saturating_add(message_size);
     }
 
     /// Handle incoming SUBSCRIBE from a peer.
-    /// 
+    ///
     /// GossipSub v1.1 Enhancement: Eagerly GRAFT known-good peers when mesh is
     /// under-populated. This accelerates mesh formation while maintaining security:
-    /// 
+    ///
     /// SECURITY: Only peers with positive score (proven track record) are eligible
     /// for eager GRAFT. Fresh/unknown peers are added as lazy and must prove
     /// themselves through successful message delivery before promotion.
@@ -2179,41 +2345,42 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         // Get peer score before mutable borrow of topics
         // SECURITY: Score > 0 required for eager GRAFT (Sybil resistance)
         let peer_score = self.get_peer_score(from);
-        
+
         // Check backoff before mutable borrow
         let in_backoff = self.is_in_backoff(from, topic);
-        
+
         // Determine action and modify state in one borrow scope
         let (should_graft, mesh_size) = {
             let Some(state) = self.topics.get_mut(topic) else {
                 return;
             };
-            
+
             // Already tracking this peer
             if state.contains(from) {
                 return;
             }
-            
+
             // === SECURITY CHECKS FOR EAGER GRAFT ===
-            
+
             // 1. Mesh must be under-populated (below target D)
             let mesh_under_target = state.eager_peers.len() < self.config.mesh_n;
-            
+
             // 2. Respect PRUNE backoff (prevents prune→immediate-rejoin attack)
             // 3. Peer score must be positive (prevents unknown/Sybil peers)
             //    Fresh peers start at 0, must have prior positive interaction
-            let eligible_for_eager = mesh_under_target 
-                && !in_backoff 
-                && peer_score > 0.0;
-            
+            let eligible_for_eager = mesh_under_target && !in_backoff && peer_score > 0.0;
+
             // 4. SECURITY: D_out enforcement - ensure minimum outbound peers before
             //    accepting more inbound. Prevents eclipse attacks.
             let outbound_count = state.outbound_mesh_count();
             let inbound_mesh = state.eager_peers.len().saturating_sub(outbound_count);
-            let max_inbound = self.config.mesh_n.saturating_sub(self.config.mesh_outbound_min);
-            let inbound_quota_available = inbound_mesh < max_inbound 
-                || outbound_count >= self.config.mesh_outbound_min;
-            
+            let max_inbound = self
+                .config
+                .mesh_n
+                .saturating_sub(self.config.mesh_outbound_min);
+            let inbound_quota_available =
+                inbound_mesh < max_inbound || outbound_count >= self.config.mesh_outbound_min;
+
             if eligible_for_eager && inbound_quota_available {
                 // === EAGER GRAFT: Known-good peer, mesh needs members ===
                 state.eager_peers.insert(*from);
@@ -2222,7 +2389,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             } else {
                 // === LAZY ADD: New/unknown peer or mesh is full ===
                 state.add_peer_with_limits(*from, self.config.mesh_n, self.config.gossip_lazy);
-                
+
                 trace!(
                     peer = %hex::encode(&from.as_bytes()[..8]),
                     topic = %topic,
@@ -2234,17 +2401,21 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 (false, 0)
             }
         };
-        
+
         // Perform async operations outside the borrow scope
         if should_graft {
             // Queue GRAFT message
-            self.queue_message(from, GossipSubRequest::Graft {
-                topic: topic.to_string(),
-            }).await;
-            
+            self.queue_message(
+                from,
+                GossipSubRequest::Graft {
+                    topic: topic.to_string(),
+                },
+            )
+            .await;
+
             // Record mesh join for peer scoring (P1: time in mesh)
             self.score_mesh_joined(from, topic);
-            
+
             debug!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
                 topic = %topic,
@@ -2268,11 +2439,15 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     async fn handle_graft(&mut self, from: &Identity, topic: &str) {
         if !self.subscriptions.contains(topic) {
-            self.queue_message(from, GossipSubRequest::Prune {
-                topic: topic.to_string(),
-                peers: Vec::new(),
-                backoff_secs: None, // Use default backoff (60s per spec)
-            }).await;
+            self.queue_message(
+                from,
+                GossipSubRequest::Prune {
+                    topic: topic.to_string(),
+                    peers: Vec::new(),
+                    backoff_secs: None, // Use default backoff (60s per spec)
+                },
+            )
+            .await;
             return;
         }
 
@@ -2290,10 +2465,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             return;
         };
         state.promote_to_eager_with_limit(*from, self.config.mesh_n);
-        
+
         // GossipSub v1.1: Record mesh join for peer scoring (P1)
         self.score_mesh_joined(from, topic);
-        
+
         debug!(
             peer = %hex::encode(&from.as_bytes()[..8]),
             topic = %topic,
@@ -2301,40 +2476,46 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         );
     }
 
-    async fn handle_prune(&mut self, from: &Identity, topic: &str, peers: Vec<Identity>, backoff_secs: Option<u64>) {
+    async fn handle_prune(
+        &mut self,
+        from: &Identity,
+        topic: &str,
+        peers: Vec<Identity>,
+        backoff_secs: Option<u64>,
+    ) {
         if let Some(state) = self.topics.get_mut(topic) {
             state.demote_to_lazy(*from);
-            
+
             // GossipSub v1.1: Record mesh leave for peer scoring (P3b penalty)
             self.score_mesh_left(from, topic);
-            
+
             debug!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
                 topic = %topic,
                 "peer sent prune, demoted to lazy"
             );
         }
-        
+
         // GossipSub v1.1: Record backoff - must not GRAFT during this period
         self.record_backoff(from, topic, backoff_secs);
-        
+
         // GossipSub v1.1: Process peer exchange (PX) - resolve unknown peers via DHT
         if !peers.is_empty() {
             self.process_peer_exchange(topic, peers).await;
         }
     }
-    
+
     /// Process peer exchange from PRUNE message.
     /// Resolves unknown peer identities via DHT lookup.
     async fn process_peer_exchange(&mut self, topic: &str, peer_ids: Vec<Identity>) {
         // Limit how many peers we resolve to avoid excessive DHT lookups
         const MAX_PX_RESOLVE: usize = 5;
-        
+
         let dht = match &self.dht {
             Some(d) => d.clone(),
             None => return, // No DHT, can't resolve
         };
-        
+
         let mut resolved = 0;
         for peer_id in peer_ids.into_iter().take(MAX_PX_RESOLVE * 2) {
             // Skip self and already-known peers
@@ -2344,29 +2525,33 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             if self.contacts.contains(&peer_id) {
                 continue;
             }
-            
+
             // Try to resolve via DHT routing table first (fast, local)
             if let Some(contact) = dht.lookup_contact(&peer_id).await {
                 self.store_contact(contact.clone());
-                
+
                 // Add to topic as lazy peer (can be promoted via GRAFT later)
                 if let Some(state) = self.topics.get_mut(topic) {
-                    state.add_peer_with_limits(peer_id, self.config.mesh_n, self.config.gossip_lazy);
+                    state.add_peer_with_limits(
+                        peer_id,
+                        self.config.mesh_n,
+                        self.config.gossip_lazy,
+                    );
                 }
-                
+
                 trace!(
                     peer = %hex::encode(&peer_id.as_bytes()[..8]),
                     topic = %topic,
                     "resolved peer from PRUNE PX via DHT"
                 );
-                
+
                 resolved += 1;
                 if resolved >= MAX_PX_RESOLVE {
                     break;
                 }
             }
         }
-        
+
         if resolved > 0 {
             debug!(
                 topic = %topic,
@@ -2375,7 +2560,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             );
         }
     }
-    
+
     /// Bootstrap mesh from DHT when subscribing to a topic with no known peers.
     /// Discovers peers close to our identity and adds them as potential mesh members.
     async fn bootstrap_mesh_from_dht(&mut self, topic: &str) {
@@ -2383,7 +2568,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             Some(d) => d.clone(),
             None => return,
         };
-        
+
         // Find peers close to our identity
         let closest = match dht.iterative_find_node(self.local_identity).await {
             Ok(peers) => peers,
@@ -2392,29 +2577,33 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 return;
             }
         };
-        
+
         if closest.is_empty() {
             return;
         }
-        
+
         // Add discovered peers to topic (limit to mesh target)
         let mut added = 0;
         for contact in closest.into_iter().take(self.config.mesh_n * 2) {
             if contact.identity == self.local_identity {
                 continue;
             }
-            
+
             // Store contact for future use
             self.store_contact(contact.clone());
-            
+
             // Add to topic state
             if let Some(state) = self.topics.get_mut(topic)
-                && state.add_peer_with_limits(contact.identity, self.config.mesh_n, self.config.gossip_lazy)
+                && state.add_peer_with_limits(
+                    contact.identity,
+                    self.config.mesh_n,
+                    self.config.gossip_lazy,
+                )
             {
                 added += 1;
             }
         }
-        
+
         if added > 0 {
             debug!(
                 topic = %topic,
@@ -2464,7 +2653,9 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         {
             // LruCache automatically enforces MAX_SEQNO_TRACKING_SOURCES bound
             // by evicting least-recently-used entries when capacity is reached.
-            let source_tracker = self.seqno_tracker.get_or_insert_mut(source, SeqnoTracker::default);
+            let source_tracker = self
+                .seqno_tracker
+                .get_or_insert_mut(source, SeqnoTracker::default);
             if !source_tracker.check_and_record(seqno) {
                 debug!(
                     from = %hex::encode(&from.as_bytes()[..8]),
@@ -2479,7 +2670,9 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         {
             // LruCache automatically enforces MAX_RATE_LIMIT_ENTRIES bound
             // by evicting least-recently-used entries when capacity is reached.
-            let limiter = self.rate_limits.get_or_insert_mut(*from, PeerRateLimit::default);
+            let limiter = self
+                .rate_limits
+                .get_or_insert_mut(*from, PeerRateLimit::default);
             if limiter.check_and_record(self.config.per_peer_rate_limit) {
                 debug!(from = %hex::encode(&from.as_bytes()[..8]), "peer rate limited");
                 // Score penalty for excessive messages (P7)
@@ -2494,12 +2687,16 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             if let Some(state) = self.topics.get_mut(topic) {
                 state.demote_to_lazy(*from);
             }
-            
-            self.queue_message(from, GossipSubRequest::Prune {
-                topic: topic.to_string(),
-                peers: Vec::new(),
-                backoff_secs: None, // Use default backoff (60s per spec)
-            }).await;
+
+            self.queue_message(
+                from,
+                GossipSubRequest::Prune {
+                    topic: topic.to_string(),
+                    peers: Vec::new(),
+                    backoff_secs: None, // Use default backoff (60s per spec)
+                },
+            )
+            .await;
 
             trace!(
                 msg_id = %hex::encode(&msg_id[..8]),
@@ -2512,21 +2709,24 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         // Score reward for first message delivery (P2)
         self.score_first_message_delivered(from, topic);
 
-        self.cache_message(msg_id, CachedMessage {
-            topic: topic.to_string(),
-            source,
-            seqno,
-            data: data.clone(),
-            signature: signature.clone(),
-            cached_at: Instant::now(),
-        });
+        self.cache_message(
+            msg_id,
+            CachedMessage {
+                topic: topic.to_string(),
+                source,
+                seqno,
+                data: data.clone(),
+                signature: signature.clone(),
+                cached_at: Instant::now(),
+            },
+        );
 
         if let Some(state) = self.topics.get_mut(topic) {
             // Update global pending IWant counter when message is received
             if state.message_received(&msg_id) {
                 self.global_pending_iwants = self.global_pending_iwants.saturating_sub(1);
             }
-            
+
             state.recent_messages.push_back(msg_id);
             if state.recent_messages.len() > self.config.max_ihave_length {
                 state.recent_messages.pop_front();
@@ -2556,8 +2756,16 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             }
         }
 
-        let eager_peers: Vec<Identity> = self.topics.get(topic)
-            .map(|s| s.eager_peers.iter().filter(|p| **p != *from).copied().collect())
+        let eager_peers: Vec<Identity> = self
+            .topics
+            .get(topic)
+            .map(|s| {
+                s.eager_peers
+                    .iter()
+                    .filter(|p| **p != *from)
+                    .copied()
+                    .collect()
+            })
             .unwrap_or_default();
 
         let forward_msg = GossipSubRequest::Publish {
@@ -2592,7 +2800,8 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     }
 
     async fn handle_ihave(&mut self, from: &Identity, topic: &str, msg_ids: Vec<MessageId>) {
-        let missing: Vec<MessageId> = msg_ids.into_iter()
+        let missing: Vec<MessageId> = msg_ids
+            .into_iter()
             .filter(|id| !self.message_cache.contains(id))
             .collect();
 
@@ -2606,7 +2815,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
         if let Some(state) = self.topics.get_mut(topic) {
             state.promote_to_eager_with_limit(*from, self.config.mesh_n);
-            
+
             for msg_id in &missing {
                 // SECURITY: Enforce global pending IWant limit to prevent memory exhaustion
                 if self.global_pending_iwants >= MAX_GLOBAL_PENDING_IWANTS {
@@ -2618,7 +2827,8 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     break;
                 }
                 let delta = state.record_iwant(*msg_id, *from);
-                self.global_pending_iwants = (self.global_pending_iwants as i32 + delta).max(0) as usize;
+                self.global_pending_iwants =
+                    (self.global_pending_iwants as i32 + delta).max(0) as usize;
                 recorded_ids.push(*msg_id);
             }
         }
@@ -2629,21 +2839,29 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         }
 
         // GossipSub v1.1: Only GRAFT if not in backoff period
-        if !self.is_in_backoff(from, topic) {
-            self.queue_message(from, GossipSubRequest::Graft {
-                topic: topic.to_string(),
-            }).await;
-        } else {
+        if self.is_in_backoff(from, topic) {
             trace!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
                 topic = %topic,
                 "skipping GRAFT due to backoff period"
             );
+        } else {
+            self.queue_message(
+                from,
+                GossipSubRequest::Graft {
+                    topic: topic.to_string(),
+                },
+            )
+            .await;
         }
 
-        self.queue_message(from, GossipSubRequest::IWant { 
-            msg_ids: recorded_ids.clone() 
-        }).await;
+        self.queue_message(
+            from,
+            GossipSubRequest::IWant {
+                msg_ids: recorded_ids.clone(),
+            },
+        )
+        .await;
 
         debug!(
             from = %hex::encode(&from.as_bytes()[..8]),
@@ -2664,7 +2882,9 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         }
 
         {
-            let limiter = self.rate_limits.get_or_insert_mut(*from, PeerRateLimit::default);
+            let limiter = self
+                .rate_limits
+                .get_or_insert_mut(*from, PeerRateLimit::default);
             if limiter.check_and_record_iwant(DEFAULT_IWANT_RATE_LIMIT) {
                 warn!(peer = %hex::encode(&from.as_bytes()[..8]), "IWant rate limited");
                 return;
@@ -2680,14 +2900,18 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 }
                 bytes_sent = bytes_sent.saturating_add(cached.data.len());
 
-                self.queue_message(from, GossipSubRequest::Publish {
-                    topic: cached.topic.clone(),
-                    msg_id,
-                    source: cached.source,
-                    seqno: cached.seqno,
-                    data: cached.data.clone(),
-                    signature: cached.signature.clone(),
-                }).await;
+                self.queue_message(
+                    from,
+                    GossipSubRequest::Publish {
+                        topic: cached.topic.clone(),
+                        msg_id,
+                        source: cached.source,
+                        seqno: cached.seqno,
+                        data: cached.data.clone(),
+                        signature: cached.signature.clone(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -2708,7 +2932,9 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             msg_ids
         };
 
-        let tracker = self.idontwant.get_or_insert_mut(*from, IDontWantTracker::default);
+        let tracker = self
+            .idontwant
+            .get_or_insert_mut(*from, IDontWantTracker::default);
         for msg_id in msg_ids {
             tracker.add(msg_id);
         }
@@ -2730,14 +2956,16 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     }
 
     /// Handle RelaySignal - mesh-mediated relay signaling.
-    /// 
+    ///
     /// This allows relay signals to be forwarded through the GossipSub mesh
     /// instead of requiring a dedicated signaling connection to the relay.
-    /// 
+    ///
     /// # Security
     /// - Only forwards to relay_signal_tx if target matches our identity
     /// - Verifies the cryptographic signature from from_peer to prevent forgery
+    /// - Rejects stale signals based on timestamp (replay protection)
     /// - The sender must be a mesh peer to prevent amplification attacks
+    #[allow(clippy::too_many_arguments)]
     async fn handle_relay_signal(
         &mut self,
         from: &Identity,
@@ -2745,6 +2973,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         from_peer: Identity,
         session_id: [u8; 16],
         relay_data_addr: String,
+        timestamp_ms: u64,
         signature: Vec<u8>,
     ) {
         // Only process signals intended for us
@@ -2758,7 +2987,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         }
 
         // Verify sender is in our mesh (prevents relay signal amplification)
-        let is_mesh_peer = self.topics.values().any(|state| state.eager_peers.contains(from));
+        let is_mesh_peer = self
+            .topics
+            .values()
+            .any(|state| state.eager_peers.contains(from));
         if !is_mesh_peer {
             warn!(
                 from = %hex::encode(&from.as_bytes()[..8]),
@@ -2767,10 +2999,36 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             return;
         }
 
+        // SECURITY HARDENING: Check timestamp for replay protection.
+        // Reject signals that are too old or too far in the future.
+        let now_ms = crate::identity::now_ms();
+        let age_ms = now_ms.saturating_sub(timestamp_ms);
+        if age_ms > RELAY_SIGNAL_MAX_AGE_MS {
+            warn!(
+                from_peer = %hex::encode(&from_peer.as_bytes()[..8]),
+                age_ms = age_ms,
+                max_age_ms = RELAY_SIGNAL_MAX_AGE_MS,
+                "rejecting stale relay signal"
+            );
+            return;
+        }
+        // Allow small future timestamps due to clock skew (5 seconds tolerance)
+        const FUTURE_TOLERANCE_MS: u64 = 5_000;
+        if timestamp_ms > now_ms + FUTURE_TOLERANCE_MS {
+            warn!(
+                from_peer = %hex::encode(&from_peer.as_bytes()[..8]),
+                timestamp_ms = timestamp_ms,
+                now_ms = now_ms,
+                "rejecting relay signal with future timestamp"
+            );
+            return;
+        }
+
         // SECURITY: Verify the signature from from_peer to prevent forgery.
         // This ensures the signal genuinely came from the claimed initiator,
         // not a malicious mesh peer spoofing the from_peer identity.
-        let payload = build_relay_signal_signed_payload(&target, &session_id, &relay_data_addr);
+        let payload =
+            build_relay_signal_signed_payload(&target, &session_id, &relay_data_addr, timestamp_ms);
         if let Err(e) = crate::crypto::verify_with_domain(
             &from_peer,
             RELAY_SIGNAL_SIGNATURE_DOMAIN,
@@ -2807,14 +3065,15 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     }
 
     /// Send a relay signal to a target peer via mesh.
-    /// 
+    ///
     /// Looks up the target in mesh peers or known contacts and sends directly.
     /// This is the sending side of mesh-mediated signaling.
-    /// 
+    ///
     /// # Security
     /// - Only sends to known mesh peers or peers we have contact info for
     /// - No gossip flooding - direct unicast to target or mesh neighbors
     /// - Messages are signed by the sender for authentication
+    /// - Timestamp included for replay protection
     async fn send_relay_signal_internal(
         &mut self,
         target: Identity,
@@ -2822,21 +3081,25 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         session_id: [u8; 16],
         relay_data_addr: String,
     ) -> anyhow::Result<()> {
-        // Sign the relay signal for authentication
-        let signature = sign_relay_signal(&self.keypair, &target, &session_id, &relay_data_addr);
-        
+        // Sign the relay signal for authentication (returns signature and timestamp)
+        let (signature, timestamp_ms) =
+            sign_relay_signal(&self.keypair, &target, &session_id, &relay_data_addr);
+
         let msg = GossipSubRequest::RelaySignal {
             target,
             from_peer,
             session_id,
             relay_data_addr,
+            timestamp_ms,
             signature,
         };
-        
+
         // Check if target is a direct mesh peer
-        let is_mesh_peer = self.topics.values()
+        let is_mesh_peer = self
+            .topics
+            .values()
             .any(|state| state.eager_peers.contains(&target));
-        
+
         if is_mesh_peer {
             // Direct send to mesh peer
             if let Some(contact) = self.contacts.get(&target) {
@@ -2847,7 +3110,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                         error = %e,
                         "failed to send relay signal to mesh peer"
                     );
-                    anyhow::bail!("failed to send relay signal: {}", e);
+                    anyhow::bail!("failed to send relay signal: {e}");
                 }
                 debug!(
                     target = %hex::encode(&target.as_bytes()[..8]),
@@ -2856,32 +3119,38 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 return Ok(());
             }
         }
-        
+
         // Target not in our mesh - try to forward via mesh peers who might know them
         // This is a limited fan-out to immediate mesh peers only (not full gossip)
         let mesh_contacts = self.get_mesh_peer_contacts();
         if mesh_contacts.is_empty() {
             anyhow::bail!("no mesh peers available to forward relay signal");
         }
-        
+
         // Send to a subset of mesh peers (limit fan-out to prevent amplification)
         const MAX_RELAY_SIGNAL_FANOUT: usize = 3;
-        let targets: Vec<_> = mesh_contacts.into_iter()
+        let targets: Vec<_> = mesh_contacts
+            .into_iter()
             .filter(|c| c.identity != target) // Don't send back to target
             .take(MAX_RELAY_SIGNAL_FANOUT)
             .collect();
-        
+
         let mut sent = 0;
         for contact in targets {
-            if self.network.send_gossipsub(&contact, msg.clone()).await.is_ok() {
+            if self
+                .network
+                .send_gossipsub(&contact, msg.clone())
+                .await
+                .is_ok()
+            {
                 sent += 1;
             }
         }
-        
+
         if sent == 0 {
             anyhow::bail!("failed to forward relay signal to any mesh peer");
         }
-        
+
         debug!(
             target = %hex::encode(&target.as_bytes()[..8]),
             fanout = sent,
@@ -2896,14 +3165,14 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         for topic in subscribed_topics {
             // GossipSub v1.1: Mesh maintenance
             self.mesh_maintenance(&topic).await;
-            
+
             self.lazy_push(&topic).await;
             self.check_timeouts(&topic).await;
         }
 
         // GossipSub v1.1: Apply score decay
         self.decay_scores();
-        
+
         // GossipSub v1.1: Clean up expired backoff entries
         self.cleanup_backoff();
 
@@ -2912,11 +3181,11 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
         self.cleanup_stale_state();
         self.flush_pending_queues().await;
-        
+
         // DHT integration: notify DHT of active mesh peer contacts
         self.notify_dht_of_mesh_peers().await;
     }
-    
+
     /// Notify DHT of mesh peer contacts (fire-and-forget).
     /// This keeps the DHT routing table fresh with actively-used peers.
     async fn notify_dht_of_mesh_peers(&mut self) {
@@ -2924,10 +3193,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             Some(d) => d,
             None => return,
         };
-        
+
         // Collect a sample of mesh peers to report (limit to avoid overhead)
         let mut peers_to_report: Vec<Contact> = Vec::with_capacity(5);
-        
+
         for state in self.topics.values() {
             for peer_id in state.eager_peers.iter().take(2) {
                 if let Some(contact) = self.contacts.peek(peer_id)
@@ -2940,7 +3209,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 break;
             }
         }
-        
+
         // Fire-and-forget: notify DHT of these contacts
         // SECURITY: Use observe_direct_peer() because these peers are already
         // connected via mTLS, bypassing the S/Kademlia PoW requirement.
@@ -2962,32 +3231,36 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         } else {
             return;
         };
-        
+
         // GRAFT: Add peers if mesh is too small
         if mesh_count < self.config.mesh_n_low && !lazy_peers.is_empty() {
             let needed = self.config.mesh_n.saturating_sub(mesh_count);
             let mut grafted = 0;
-            
+
             for peer in lazy_peers {
                 if grafted >= needed {
                     break;
                 }
-                
+
                 // Skip peers in backoff
                 if self.is_in_backoff(&peer, topic) {
                     continue;
                 }
-                
+
                 // Skip low-score peers
                 if self.is_peer_below_publish_threshold(&peer) {
                     continue;
                 }
-                
+
                 // Send GRAFT
-                self.queue_message(&peer, GossipSubRequest::Graft {
-                    topic: topic.to_string(),
-                }).await;
-                
+                self.queue_message(
+                    &peer,
+                    GossipSubRequest::Graft {
+                        topic: topic.to_string(),
+                    },
+                )
+                .await;
+
                 // Move to mesh and mark as outbound (we initiated GRAFT)
                 if let Some(state) = self.topics.get_mut(topic)
                     && state.lazy_peers.remove(&peer)
@@ -2996,7 +3269,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     state.mark_outbound(peer); // SECURITY: Track outbound for D_out
                     self.score_mesh_joined(&peer, topic);
                     grafted += 1;
-                    
+
                     trace!(
                         peer = %hex::encode(&peer.as_bytes()[..8]),
                         topic = %topic,
@@ -3004,7 +3277,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     );
                 }
             }
-            
+
             if grafted > 0 {
                 debug!(
                     topic = %topic,
@@ -3015,36 +3288,39 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 );
             }
         }
-        
+
         // PRUNE: Remove peers if mesh is too large
         let (mesh_count, outbound_count) = if let Some(state) = self.topics.get(topic) {
             (state.eager_peers.len(), state.outbound_mesh_count())
         } else {
             return;
         };
-        
+
         if mesh_count > self.config.mesh_n_high {
             let excess = mesh_count - self.config.mesh_n;
-            
+
             // First collect peers and their outbound status (requires topics borrow)
             let peers_with_outbound: Vec<(Identity, bool)> = {
                 if let Some(state) = self.topics.get(topic) {
-                    state.eager_peers.iter()
+                    state
+                        .eager_peers
+                        .iter()
                         .map(|p| (*p, state.is_outbound(p)))
                         .collect()
                 } else {
                     Vec::new()
                 }
             };
-            
+
             // Now compute scores (requires mutable self borrow for LRU access)
-            let peer_info: Vec<(Identity, f64, bool)> = peers_with_outbound.into_iter()
+            let peer_info: Vec<(Identity, f64, bool)> = peers_with_outbound
+                .into_iter()
                 .map(|(p, is_outbound)| {
                     let score = self.get_peer_score(&p);
                     (p, score, is_outbound)
                 })
                 .collect();
-            
+
             // Sort by: inbound first, then by score ascending (prune low-score inbound first)
             // SECURITY: This ensures we prune inbound peers before outbound peers
             let mut sorted_peers = peer_info;
@@ -3056,18 +3332,18 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     _ => a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal),
                 }
             });
-            
+
             // SECURITY: Count how many outbound we can prune while maintaining D_out
             let outbound_to_keep = self.config.mesh_outbound_min;
             let mut current_outbound = outbound_count;
             let mut pruned_count = 0;
             let mut peers_to_prune = Vec::new();
-            
+
             for (peer, _score, is_outbound) in sorted_peers {
                 if pruned_count >= excess {
                     break;
                 }
-                
+
                 // SECURITY: Don't prune outbound peers if we'd fall below D_out
                 if is_outbound && current_outbound <= outbound_to_keep {
                     trace!(
@@ -3079,32 +3355,36 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     );
                     continue;
                 }
-                
+
                 peers_to_prune.push(peer);
                 if is_outbound {
                     current_outbound = current_outbound.saturating_sub(1);
                 }
                 pruned_count += 1;
             }
-            
+
             for peer in &peers_to_prune {
                 // Get peer exchange suggestions (other mesh peers)
                 let px_peers = self.get_peer_exchange_suggestions(topic, peer);
-                
+
                 // Send PRUNE with backoff and peer exchange
-                self.queue_message(peer, GossipSubRequest::Prune {
-                    topic: topic.to_string(),
-                    peers: px_peers,
-                    backoff_secs: Some(DEFAULT_PRUNE_BACKOFF_SECS),
-                }).await;
-                
+                self.queue_message(
+                    peer,
+                    GossipSubRequest::Prune {
+                        topic: topic.to_string(),
+                        peers: px_peers,
+                        backoff_secs: Some(DEFAULT_PRUNE_BACKOFF_SECS),
+                    },
+                )
+                .await;
+
                 // Move to lazy
                 if let Some(state) = self.topics.get_mut(topic)
                     && state.eager_peers.remove(peer)
                 {
                     state.lazy_peers.insert(*peer);
                     self.score_mesh_left(peer, topic);
-                    
+
                     trace!(
                         peer = %hex::encode(&peer.as_bytes()[..8]),
                         topic = %topic,
@@ -3112,7 +3392,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     );
                 }
             }
-            
+
             if !peers_to_prune.is_empty() {
                 debug!(
                     topic = %topic,
@@ -3123,83 +3403,93 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 );
             }
         }
-        
+
         // GossipSub v1.1 Adaptive Gossip: D_score and Opportunistic Grafting
         self.adaptive_gossip_maintenance(topic).await;
     }
 
     /// GossipSub v1.1 Adaptive Gossip maintenance.
-    /// 
+    ///
     /// Two mechanisms to improve mesh quality:
     /// 1. **D_score Enforcement**: Ensure minimum number of high-scoring peers in mesh
     /// 2. **Opportunistic Grafting**: If median mesh score is below threshold, graft
     ///    high-scoring lazy peers to improve overall mesh quality
-    /// 
+    ///
     /// SECURITY: These mechanisms defend against "cold boot" attacks where an attacker
     /// fills the mesh with mediocre but not-yet-graylisted peers.
     async fn adaptive_gossip_maintenance(&mut self, topic: &str) {
         // Collect mesh peer identities first (avoids borrow conflict with get_peer_score)
-        let mesh_peers: Vec<Identity> = self.topics.get(topic)
+        let mesh_peers: Vec<Identity> = self
+            .topics
+            .get(topic)
             .map(|state| state.eager_peers.iter().copied().collect())
             .unwrap_or_default();
-        
+
         if mesh_peers.is_empty() {
             return;
         }
-        
+
         // Now compute scores (requires mutable self borrow for LRU)
-        let mesh_peer_scores: Vec<(Identity, f64)> = mesh_peers.iter()
+        let mesh_peer_scores: Vec<(Identity, f64)> = mesh_peers
+            .iter()
             .map(|p| (*p, self.get_peer_score(p)))
             .collect();
-        
+
         // Count high-scoring peers (score >= 0 is considered "good")
         let high_score_threshold = 0.0;
-        let high_scoring_count = mesh_peer_scores.iter()
+        let high_scoring_count = mesh_peer_scores
+            .iter()
             .filter(|(_, score)| *score >= high_score_threshold)
             .count();
-        
+
         // Calculate median score
         let median_score = {
             let mut scores: Vec<f64> = mesh_peer_scores.iter().map(|(_, s)| *s).collect();
             scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let mid = scores.len() / 2;
             if scores.len().is_multiple_of(2) && scores.len() >= 2 {
-                (scores[mid - 1] + scores[mid]) / 2.0
+                f64::midpoint(scores[mid - 1], scores[mid])
             } else {
                 scores[mid]
             }
         };
-        
+
         // Collect lazy peer identities first (avoids borrow conflict)
-        let lazy_peers: Vec<Identity> = self.topics.get(topic)
+        let lazy_peers: Vec<Identity> = self
+            .topics
+            .get(topic)
             .map(|state| state.lazy_peers.iter().copied().collect())
             .unwrap_or_default();
-        
+
         // Now compute scores for lazy peers
-        let lazy_peer_scores: Vec<(Identity, f64)> = lazy_peers.iter()
+        let lazy_peer_scores: Vec<(Identity, f64)> = lazy_peers
+            .iter()
             .map(|p| (*p, self.get_peer_score(p)))
             .collect();
-        
+
         // Sort lazy peers by score descending (highest first)
-        let mut sorted_lazy: Vec<(Identity, f64)> = lazy_peer_scores.into_iter()
-            .filter(|(p, score)| {
-                *score >= high_score_threshold && !self.is_in_backoff(p, topic)
-            })
+        let mut sorted_lazy: Vec<(Identity, f64)> = lazy_peer_scores
+            .into_iter()
+            .filter(|(p, score)| *score >= high_score_threshold && !self.is_in_backoff(p, topic))
             .collect();
         sorted_lazy.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let mut grafted = 0usize;
-        
+
         // 1. D_score enforcement: Ensure minimum high-scoring peers
         if high_scoring_count < self.config.mesh_d_score && !sorted_lazy.is_empty() {
             let needed = self.config.mesh_d_score.saturating_sub(high_scoring_count);
-            
+
             for (peer, score) in sorted_lazy.iter().take(needed) {
                 // Send GRAFT
-                self.queue_message(peer, GossipSubRequest::Graft {
-                    topic: topic.to_string(),
-                }).await;
-                
+                self.queue_message(
+                    peer,
+                    GossipSubRequest::Graft {
+                        topic: topic.to_string(),
+                    },
+                )
+                .await;
+
                 // Move to mesh
                 if let Some(state) = self.topics.get_mut(topic)
                     && state.lazy_peers.remove(peer)
@@ -3208,7 +3498,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     state.mark_outbound(*peer);
                     self.score_mesh_joined(peer, topic);
                     grafted += 1;
-                    
+
                     trace!(
                         peer = %hex::encode(&peer.as_bytes()[..8]),
                         topic = %topic,
@@ -3217,7 +3507,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     );
                 }
             }
-            
+
             if grafted > 0 {
                 debug!(
                     topic = %topic,
@@ -3228,28 +3518,31 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 );
             }
         }
-        
+
         // 2. Opportunistic Grafting: If median score is below threshold
         if median_score < self.config.opportunistic_graft_threshold {
             // Find high-scoring lazy peers we haven't already grafted
-            let already_grafted: HashSet<Identity> = sorted_lazy.iter()
-                .take(grafted)
-                .map(|(p, _)| *p)
-                .collect();
-            
-            let candidates: Vec<(Identity, f64)> = sorted_lazy.into_iter()
+            let already_grafted: HashSet<Identity> =
+                sorted_lazy.iter().take(grafted).map(|(p, _)| *p).collect();
+
+            let candidates: Vec<(Identity, f64)> = sorted_lazy
+                .into_iter()
                 .filter(|(p, _)| !already_grafted.contains(p))
                 .take(self.config.opportunistic_graft_peers)
                 .collect();
-            
+
             let mut opportunistic_grafted = 0usize;
-            
+
             for (peer, score) in candidates {
                 // Send GRAFT
-                self.queue_message(&peer, GossipSubRequest::Graft {
-                    topic: topic.to_string(),
-                }).await;
-                
+                self.queue_message(
+                    &peer,
+                    GossipSubRequest::Graft {
+                        topic: topic.to_string(),
+                    },
+                )
+                .await;
+
                 // Move to mesh
                 if let Some(state) = self.topics.get_mut(topic)
                     && state.lazy_peers.remove(&peer)
@@ -3258,7 +3551,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     state.mark_outbound(peer);
                     self.score_mesh_joined(&peer, topic);
                     opportunistic_grafted += 1;
-                    
+
                     trace!(
                         peer = %hex::encode(&peer.as_bytes()[..8]),
                         topic = %topic,
@@ -3267,7 +3560,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     );
                 }
             }
-            
+
             if opportunistic_grafted > 0 {
                 debug!(
                     topic = %topic,
@@ -3284,10 +3577,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     fn cleanup_idontwant(&mut self) {
         // Collect peer IDs first to avoid borrow conflicts with LruCache
         let peers: Vec<Identity> = self.idontwant.iter().map(|(id, _)| *id).collect();
-        
+
         // Track which trackers become empty after expiration
         let mut empty_peers = Vec::new();
-        
+
         // Expire old entries in each tracker
         for peer in peers {
             if let Some(tracker) = self.idontwant.get_mut(&peer) {
@@ -3297,7 +3590,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 }
             }
         }
-        
+
         // Remove empty trackers
         for peer in empty_peers {
             self.idontwant.pop(&peer);
@@ -3352,19 +3645,24 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     }
 
     async fn check_timeouts(&mut self, topic: &str) {
-        let (retries, completed_count): (Vec<(MessageId, Identity)>, usize) = if let Some(state) = self.topics.get_mut(topic) {
-            state.check_iwant_timeouts(self.config.ihave_timeout)
-        } else {
-            (Vec::new(), 0)
-        };
-        
+        let (retries, completed_count): (Vec<(MessageId, Identity)>, usize) =
+            if let Some(state) = self.topics.get_mut(topic) {
+                state.check_iwant_timeouts(self.config.ihave_timeout)
+            } else {
+                (Vec::new(), 0)
+            };
+
         // Update global pending IWant count for completed (timed out) entries
         self.global_pending_iwants = self.global_pending_iwants.saturating_sub(completed_count);
 
         for (msg_id, peer) in retries {
-            self.queue_message(&peer, GossipSubRequest::IWant {
-                msg_ids: vec![msg_id],
-            }).await;
+            self.queue_message(
+                &peer,
+                GossipSubRequest::IWant {
+                    msg_ids: vec![msg_id],
+                },
+            )
+            .await;
             trace!(
                 msg_id = %hex::encode(&msg_id[..8]),
                 peer = %hex::encode(&peer.as_bytes()[..8]),
@@ -3385,21 +3683,23 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     fn evict_expired_cache_entries(&mut self) {
         let ttl = self.config.message_cache_ttl;
         let mut expired_ids = Vec::new();
-        
+
         // Collect expired message IDs
-        for (msg_id, cached) in self.message_cache.iter() {
+        for (msg_id, cached) in &self.message_cache {
             if cached.cached_at.elapsed() > ttl {
                 expired_ids.push(*msg_id);
             }
         }
-        
+
         // Remove expired entries
         for msg_id in &expired_ids {
             if let Some(evicted) = self.message_cache.pop(msg_id) {
-                self.message_cache_bytes = self.message_cache_bytes.saturating_sub(evicted.size_bytes());
+                self.message_cache_bytes = self
+                    .message_cache_bytes
+                    .saturating_sub(evicted.size_bytes());
             }
         }
-        
+
         if !expired_ids.is_empty() {
             trace!(
                 evicted = expired_ids.len(),
@@ -3409,7 +3709,6 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             );
         }
     }
-
 
     async fn queue_message(&mut self, peer: &Identity, msg: GossipSubRequest) {
         if let Err(e) = self.send_to_peer(peer, msg.clone()).await {
@@ -3421,19 +3720,23 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         } else {
             return;
         }
-        
+
         if !self.outbound.contains_key(peer) && self.outbound.len() >= MAX_OUTBOUND_PEERS {
-            let smallest = self.outbound.iter()
+            let smallest = self
+                .outbound
+                .iter()
                 .min_by_key(|(_, msgs)| msgs.len())
                 .map(|(id, _)| *id);
             if let Some(evict) = smallest {
                 self.outbound.remove(&evict);
             }
         }
-        
-        let total: usize = self.outbound.values().map(|v| v.len()).sum();
+
+        let total: usize = self.outbound.values().map(std::vec::Vec::len).sum();
         if total >= MAX_TOTAL_OUTBOUND_MESSAGES
-            && let Some(largest) = self.outbound.iter()
+            && let Some(largest) = self
+                .outbound
+                .iter()
                 .max_by_key(|(_, msgs)| msgs.len())
                 .map(|(id, _)| *id)
             && let Some(queue) = self.outbound.get_mut(&largest)
@@ -3441,14 +3744,14 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             let drain = (queue.len() / 2).max(1);
             queue.drain(0..drain);
         }
-        
+
         let queue = self.outbound.entry(*peer).or_default();
-        
+
         if queue.len() >= MAX_OUTBOUND_PER_PEER {
             let drain = queue.len() / 2;
             queue.drain(0..drain);
         }
-        
+
         queue.push(msg);
     }
 }
@@ -3476,7 +3779,10 @@ mod tests {
     #[test]
     fn flood_protection_constants() {
         const _: () = assert!(MAX_MESSAGE_SIZE >= 1024, "max message size too small");
-        const _: () = assert!(MAX_MESSAGE_SIZE <= 1024 * 1024, "max message size too large");
+        const _: () = assert!(
+            MAX_MESSAGE_SIZE <= 1024 * 1024,
+            "max message size too large"
+        );
         const _: () = assert!(MAX_TOPIC_LENGTH >= 32, "max topic length too small");
         const _: () = assert!(DEFAULT_PUBLISH_RATE_LIMIT > 0);
         const _: () = assert!(DEFAULT_PER_PEER_RATE_LIMIT > 0);
@@ -3494,7 +3800,7 @@ mod tests {
             per_peer_rate_limit: 25,
             ..Default::default()
         };
-        
+
         assert_eq!(config.mesh_n, 8);
         assert_eq!(config.gossip_lazy, 12);
         assert_eq!(config.max_message_size, 1024);
@@ -3671,7 +3977,7 @@ mod tests {
     #[test]
     fn gossipsub_config_all_fields_accessible() {
         let config = GossipSubConfig::default();
-        
+
         // New GossipSub v1.1 mesh parameters
         assert!(config.mesh_n > 0);
         assert!(config.mesh_n_low > 0);
@@ -3679,19 +3985,19 @@ mod tests {
         assert!(config.mesh_outbound_min > 0);
         assert!(config.gossip_lazy > 0);
         assert!(config.prune_backoff.as_secs() > 0);
-        
+
         // Timing and caching
         assert!(config.ihave_timeout.as_secs() > 0);
         assert!(config.heartbeat_interval.as_millis() > 0);
         assert!(config.message_cache_size > 0);
         assert!(config.message_cache_ttl.as_secs() > 0);
-        
+
         // Size and rate limits
         assert!(config.max_message_size > 0);
         assert!(config.max_ihave_length > 0);
         assert!(config.publish_rate_limit > 0);
         assert!(config.per_peer_rate_limit > 0);
-        
+
         let cloned = config.clone();
         let _debug = format!("{:?}", cloned);
     }
@@ -3706,14 +4012,14 @@ mod tests {
             msg_id: [0xABu8; 32],
             received_at: Instant::now(),
         };
-        
+
         assert_eq!(msg.topic, "test");
         assert_eq!(msg.seqno, 42);
         assert_eq!(msg.data, vec![1, 2, 3]);
         assert_eq!(msg.msg_id, [0xABu8; 32]);
         let _ = msg.source;
         let _ = msg.received_at;
-        
+
         let cloned = msg.clone();
         let _debug = format!("{:?}", cloned);
     }
@@ -3722,12 +4028,12 @@ mod tests {
     fn topic_state_should_lazy_push() {
         let mut state = TopicState::default();
         let peer = Identity::from_bytes([1u8; 32]);
-        
+
         state.add_eager(peer);
         state.demote_to_lazy(peer);
-        
+
         let _ = state.should_lazy_push(DEFAULT_HEARTBEAT_INTERVAL);
-        
+
         let (retries, _completed) = state.check_iwant_timeouts(DEFAULT_IHAVE_TIMEOUT);
         assert!(retries.is_empty());
     }
@@ -3735,24 +4041,36 @@ mod tests {
     #[test]
     fn message_rejection_variants_and_display() {
         let variants = [
-            (MessageRejection::MessageTooLarge, "message size exceeds maximum allowed"),
-            (MessageRejection::TopicTooLong, "topic name exceeds maximum length"),
-            (MessageRejection::InvalidTopic, "topic name is invalid (empty or contains non-ASCII characters)"),
-            (MessageRejection::RateLimited, "local publish rate limit exceeded"),
+            (
+                MessageRejection::MessageTooLarge,
+                "message size exceeds maximum allowed",
+            ),
+            (
+                MessageRejection::TopicTooLong,
+                "topic name exceeds maximum length",
+            ),
+            (
+                MessageRejection::InvalidTopic,
+                "topic name is invalid (empty or contains non-ASCII characters)",
+            ),
+            (
+                MessageRejection::RateLimited,
+                "local publish rate limit exceeded",
+            ),
         ];
-        
+
         for (v, expected_msg) in &variants {
             // Test Clone + Copy
             let cloned = *v;
             assert_eq!(*v, cloned);
-            
+
             // Test Debug
             let _debug = format!("{:?}", cloned);
-            
+
             // Test Display
             let display = format!("{}", v);
             assert_eq!(&display, *expected_msg);
-            
+
             // Test Error trait (can convert to anyhow::Error)
             let err: anyhow::Error = (*v).into();
             assert!(err.to_string().contains(expected_msg));
@@ -3769,22 +4087,22 @@ mod tests {
         let peer1 = Identity::from_bytes([1u8; 32]);
         let peer2 = Identity::from_bytes([2u8; 32]);
         let peer3 = Identity::from_bytes([3u8; 32]);
-        
+
         // Same /16 prefix: 192.168.x.x
         let provenance = Provenance::from_addr_str("192.168.1.100:8080").unwrap();
-        
+
         // First peer - count should be 1
         let count1 = tracker.register_peer(&peer1, provenance);
         assert_eq!(count1, 1);
-        
+
         // Second peer same prefix - count should be 2
         let count2 = tracker.register_peer(&peer2, provenance);
         assert_eq!(count2, 2);
-        
+
         // Third peer same prefix - count should be 3
         let count3 = tracker.register_peer(&peer3, provenance);
         assert_eq!(count3, 3);
-        
+
         // Verify counts via get_peer_count
         assert_eq!(tracker.get_peer_count(&peer1), 3);
         assert_eq!(tracker.get_peer_count(&peer2), 3);
@@ -3796,18 +4114,18 @@ mod tests {
         let mut tracker = IpColocationTracker::new();
         let peer1 = Identity::from_bytes([1u8; 32]);
         let peer2 = Identity::from_bytes([2u8; 32]);
-        
+
         let provenance = Provenance::from_addr_str("10.0.1.50:9000").unwrap();
-        
+
         tracker.register_peer(&peer1, provenance);
         tracker.register_peer(&peer2, provenance);
         assert_eq!(tracker.get_peer_count(&peer1), 2);
-        
+
         // Unregister peer1
         tracker.unregister_peer(&peer1);
         assert_eq!(tracker.get_peer_count(&peer1), 0); // peer1 no longer tracked
         assert_eq!(tracker.get_peer_count(&peer2), 1); // peer2 count decremented
-        
+
         // Unregister peer2
         tracker.unregister_peer(&peer2);
         assert_eq!(tracker.get_peer_count(&peer2), 0);
@@ -3819,19 +4137,19 @@ mod tests {
         let peer1 = Identity::from_bytes([1u8; 32]);
         let peer2 = Identity::from_bytes([2u8; 32]);
         let peer3 = Identity::from_bytes([3u8; 32]);
-        
+
         // Different /16 prefixes
         let provenance_a = Provenance::from_addr_str("192.168.1.1:8080").unwrap();
         let provenance_b = Provenance::from_addr_str("10.0.1.1:8080").unwrap();
-        
+
         tracker.register_peer(&peer1, provenance_a);
         tracker.register_peer(&peer2, provenance_a);
         tracker.register_peer(&peer3, provenance_b);
-        
+
         // peer1 and peer2 share provenance_a (count 2)
         assert_eq!(tracker.get_peer_count(&peer1), 2);
         assert_eq!(tracker.get_peer_count(&peer2), 2);
-        
+
         // peer3 is alone in provenance_b (count 1)
         assert_eq!(tracker.get_peer_count(&peer3), 1);
     }
@@ -3844,30 +4162,30 @@ mod tests {
         let peer3 = Identity::from_bytes([3u8; 32]);
         let peer4 = Identity::from_bytes([4u8; 32]);
         let peer5 = Identity::from_bytes([5u8; 32]);
-        
+
         let provenance = Provenance::from_addr_str("172.16.0.1:8080").unwrap();
-        
+
         // 1 peer: below threshold, no penalty
         tracker.register_peer(&peer1, provenance);
         assert_eq!(tracker.calculate_p6_factor(&peer1), 0.0);
-        
+
         // 2 peers: excess = 1, penalty = 1² = 1.0
         tracker.register_peer(&peer2, provenance);
         assert_eq!(tracker.calculate_p6_factor(&peer1), 1.0);
         assert_eq!(tracker.calculate_p6_factor(&peer2), 1.0);
-        
+
         // 3 peers: excess = 2, penalty = 2² = 4.0
         tracker.register_peer(&peer3, provenance);
         assert_eq!(tracker.calculate_p6_factor(&peer1), 4.0);
-        
+
         // 4 peers: excess = 3, penalty = 3² = 9.0
         tracker.register_peer(&peer4, provenance);
         assert_eq!(tracker.calculate_p6_factor(&peer1), 9.0);
-        
+
         // 5 peers: excess = 4, penalty = 4² = 16.0
         tracker.register_peer(&peer5, provenance);
         assert_eq!(tracker.calculate_p6_factor(&peer1), 16.0);
-        
+
         // With DEFAULT_P6_WEIGHT = -10.0, raw P6 penalty would be:
         // 5 peers → -10.0 * 16.0 = -160.0 penalty per peer
         //
@@ -3881,18 +4199,18 @@ mod tests {
         let mut tracker = IpColocationTracker::new();
         let peer1 = Identity::from_bytes([1u8; 32]);
         let peer2 = Identity::from_bytes([2u8; 32]);
-        
+
         let provenance_a = Provenance::from_addr_str("192.168.1.1:8080").unwrap();
         let provenance_b = Provenance::from_addr_str("10.0.1.1:8080").unwrap();
-        
+
         // Register both peers on provenance_a
         tracker.register_peer(&peer1, provenance_a);
         tracker.register_peer(&peer2, provenance_a);
         assert_eq!(tracker.get_peer_count(&peer1), 2);
-        
+
         // Move peer2 to provenance_b (simulates reconnection from different IP)
         tracker.register_peer(&peer2, provenance_b);
-        
+
         // peer1 should now have count 1 (peer2 removed from provenance_a)
         assert_eq!(tracker.get_peer_count(&peer1), 1);
         // peer2 should have count 1 (alone in provenance_b)
@@ -3903,7 +4221,7 @@ mod tests {
     fn ip_colocation_unknown_peer_returns_zero() {
         let mut tracker = IpColocationTracker::new();
         let unknown_peer = Identity::from_bytes([99u8; 32]);
-        
+
         // Unknown peer should have count 0 and factor 0.0
         assert_eq!(tracker.get_peer_count(&unknown_peer), 0);
         assert_eq!(tracker.calculate_p6_factor(&unknown_peer), 0.0);
@@ -3914,19 +4232,19 @@ mod tests {
         let mut tracker = IpColocationTracker::new();
         let peer1 = Identity::from_bytes([1u8; 32]);
         let peer2 = Identity::from_bytes([2u8; 32]);
-        
+
         // Same /32 IPv6 prefix (first 2 segments: 2001:db8)
         let provenance1 = Provenance::from_addr_str("[2001:db8::1]:8080").unwrap();
         let provenance2 = Provenance::from_addr_str("[2001:db8:1234::1]:8080").unwrap();
-        
+
         tracker.register_peer(&peer1, provenance1);
         tracker.register_peer(&peer2, provenance2);
-        
+
         // These should be in the same /32 prefix group
         // (depends on Provenance implementation - first 2 segments combined)
         let count1 = tracker.get_peer_count(&peer1);
         let count2 = tracker.get_peer_count(&peer2);
-        
+
         // If they share a provenance, both should see count 2
         // If not, each sees count 1 (still valid, just different grouping)
         assert!(count1 >= 1);

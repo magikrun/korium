@@ -40,10 +40,10 @@
 
 mod crypto;
 mod dht;
+mod gossipsub;
 mod identity;
 mod messages;
 mod node;
-mod gossipsub;
 mod protocols;
 mod relay;
 mod rpc;
@@ -52,7 +52,10 @@ mod transport;
 #[cfg(feature = "spiffe")]
 mod thresholdca;
 
-pub use node::{Identity, IdentityProof, PoWError, POW_DIFFICULTY, Node, NodeBuilder};
+pub use node::{
+    Identity, IdentityProof, Keypair, NAMESPACE_HASH_LEN, Node, NodeBuilder, POW_DIFFICULTY,
+    PoWError,
+};
 
 // SPIFFE and Threshold CA types are accessed through Node's public API:
 // - Node::builder().spiffe_trust_domain() / .spiffe_workload_path()
@@ -60,6 +63,4 @@ pub use node::{Identity, IdentityProof, PoWError, POW_DIFFICULTY, Node, NodeBuil
 // - Node::request_ca_certificate_from_mesh()
 // DKG types are internal - generate SignerState via external tooling.
 #[cfg(feature = "spiffe")]
-pub use node::{
-    CaRequestConfig, CaPublicKey, SignerState, ThresholdCaConfig, ThresholdCaError,
-};
+pub use node::{CaPublicKey, CaRequestConfig, SignerState, ThresholdCaConfig, ThresholdCaError};

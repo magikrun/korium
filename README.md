@@ -14,6 +14,7 @@ Korium is a high-performance, secure, and adaptive networking library written in
 - **Zero Configuration** — Self-organizing mesh with automatic peer discovery
 - **NAT Traversal** — Built-in relay infrastructure and path probing via SmartSock
 - **Secure by Default** — Ed25519 identities with mutual TLS on every connection
+- **Namespace Isolation** — Multi-tenant support with encrypted, authenticated overlays
 - **Adaptive Performance** — Latency-tiered DHT with automatic path optimization
 - **Complete Stack** — PubSub messaging, request-response, direct connections, and membership management
 - **SPIFFE Compatible** — Optional X.509 URI SAN extensions for enterprise identity interoperability
@@ -440,6 +441,163 @@ let msg = rx.recv().await?;  // msg.from is verified sender
 | `PER_PEER_ENTRY_LIMIT` | 100 | DHT entries per peer |
 | `MAX_CONCURRENT_STREAMS` | 64 | QUIC streams per connection |
 | `POW_DIFFICULTY` | 24 bits | Identity PoW (Sybil resistance) |
+
+## Namespaces (Tenant Isolation)
+
+Korium supports **namespace-based isolation** for multi-tenant deployments. Namespaces create cryptographically isolated overlays on top of the global mesh infrastructure.
+
+### Architecture: Global Infrastructure, Isolated Application Traffic
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Global Infrastructure                       │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐             │
+│   │     DHT     │    │    Relay    │    │ Bootstrap   │             │
+│   │ (Discovery) │    │ (NAT Trav)  │    │  (Routing)  │             │
+│   └─────────────┘    └─────────────┘    └─────────────┘             │
+│                          ↑  ↑  ↑                                    │
+│                          │  │  │   All nodes share infrastructure   │
+│   ───────────────────────┼──┼──┼──────────────────────────────────  │
+│                          │  │  │                                    │
+│  ┌───────────────────────┴──┴──┴─────────────────────────────────┐  │
+│  │                    Namespace Gating Layer                     │  │
+│  │         Challenge-Response + Payload Encryption               │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                          ↓  ↓  ↓                                    │
+│         ┌────────────────┴──┴──┴────────────────┐                   │
+│         │        Isolated Application Traffic   │                   │
+│         │   ┌─────────────┐    ┌─────────────┐  │                   │
+│         │   │  GossipSub  │    │    Plain    │  │                   │
+│         │   │   (PubSub)  │    │   (Req/Res) │  │                   │
+│         │   └─────────────┘    └─────────────┘  │                   │
+│         └───────────────────────────────────────┘                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Properties:**
+- **DHT/Relay are global** — All nodes participate in routing and relay infrastructure
+- **GossipSub/Plain are gated** — Only peers with matching namespace secrets can exchange application traffic
+- **Authentication** — Challenge-response protocol verifies namespace membership before accepting streams
+- **Encryption** — ChaCha20-Poly1305 authenticated encryption protects all application payloads
+
+### Creating a Namespaced Node
+
+```rust
+use korium::{Node, NamespaceConfig};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Shared secret for the namespace (must be identical across all nodes in namespace)
+    let master_secret: [u8; 32] = derive_from_your_key_management_system();
+    
+    let node = Node::builder("0.0.0.0:0")
+        .namespace_config(NamespaceConfig::new(master_secret))
+        .build()
+        .await?;
+    
+    // This node can:
+    // ✓ Participate in global DHT (peer discovery)
+    // ✓ Use global relay infrastructure (NAT traversal)
+    // ✓ Only exchange GossipSub/Plain with peers that know master_secret
+    
+    Ok(())
+}
+```
+
+### NamespaceConfig Options
+
+```rust
+// Default: 1-hour epochs, 2-epoch grace period
+let config = NamespaceConfig::new(master_secret);
+
+// Custom epoch duration and grace period
+let config = NamespaceConfig::new_with_params(
+    master_secret,
+    Duration::from_secs(3600),  // Epoch duration (key rotation interval)
+    3,                          // Grace epochs (tolerance for clock skew)
+);
+```
+
+### Security Mechanisms
+
+#### 1. Challenge-Response Authentication
+
+Before accepting GossipSub or Plain streams, peers verify namespace membership:
+
+```
+Initiator                                    Responder
+    │                                            │
+    │──── Connect (QUIC mTLS) ───────────────────│
+    │                                            │
+    │──── Open Stream (GossipSub/Plain) ─────────│
+    │                                            │
+    │◄─── Challenge(nonce) ──────────────────────│
+    │                                            │
+    │──── Response(BLAKE3(session_secret ║       │
+    │              nonce ║ pubkeys)) ────────────│
+    │                                            │
+    │     ✓ Verified: Accept stream              │
+    │     ✗ Failed: Reject stream                │
+```
+
+The challenge response is bound to:
+- **Session secret** — Derived from master_secret + epoch
+- **Connection** — Both peer public keys included
+- **Freshness** — Random nonce prevents replay
+
+#### 2. Payload Encryption (ChaCha20-Poly1305)
+
+All GossipSub and Plain payloads are encrypted:
+
+```
+Encryption Key = BLAKE3("korium-ns-encrypt-v1:" ║ master_secret ║ epoch)
+
+Ciphertext = nonce (12 bytes) ║ encrypted_data ║ auth_tag (16 bytes)
+```
+
+**Properties:**
+- **Confidentiality** — Payload contents hidden from non-members
+- **Integrity** — AEAD authentication detects tampering
+- **Epoch rotation** — Keys rotate periodically; grace period allows decryption during transitions
+
+### Namespace Isolation Properties
+
+| Traffic Type | Namespaced Node Behavior |
+|--------------|--------------------------|
+| **DHT** | Global — Discovers all peers, serves routing |
+| **Relay** | Global — Uses/provides relay for all peers |
+| **GossipSub** | Isolated — Only sends/receives with namespace peers |
+| **Plain (Req/Res)** | Isolated — Only sends/receives with namespace peers |
+
+### Identity PoW Binding (Optional)
+
+For additional Sybil resistance within namespaces, bind PoW to the namespace:
+
+```rust
+// Generate keypair with PoW bound to namespace hash
+let (keypair, proof) = Keypair::generate_with_pow_for_namespace("my-namespace")?;
+
+// Build node with namespace-bound identity
+let node = Node::builder("0.0.0.0:0")
+    .with_keypair(keypair, proof)
+    .namespace_config(NamespaceConfig::new(master_secret))
+    .build()
+    .await?;
+```
+
+This ensures:
+- PoW cannot be reused across namespaces (hash is bound to namespace)
+- `namespace_hash` is hidden from serialized contacts (prevents namespace enumeration)
+- Attackers cannot forge namespace membership by observing DHT traffic
+
+### Use Cases
+
+| Scenario | Configuration |
+|----------|---------------|
+| **Multi-tenant SaaS** | Each tenant gets a unique `master_secret` |
+| **Private networks** | Namespace acts as a VPN overlay on public infrastructure |
+| **Regulatory compliance** | Isolate data flows while sharing routing infrastructure |
+| **Development/staging** | Separate environments on shared mesh |
 
 ## SPIFFE Compatibility (Optional)
 

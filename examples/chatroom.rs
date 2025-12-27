@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
         while let Some(msg) = pubsub_rx.recv().await {
             if msg.topic == format!("chat/{}", room_filter) {
                 let text = String::from_utf8_lossy(&msg.data);
-                
+
                 if let Some((name_id, _)) = text.split_once(": ")
                     && let Some((name, id_prefix)) = name_id.split_once('@')
                     && !my_identity.starts_with(id_prefix)
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
                         peers.insert(id_prefix.to_string(), name.to_string());
                     }
                 }
-                
+
                 if !text.starts_with(&format!("{}@", my_name)) {
                     println!("\x1b[32m[room]\x1b[0m {}", text);
                 }
@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
                 println!("Example: /dm 5821a288e16c6491... Hello!");
                 continue;
             }
-            
+
             let peer_identity = parts[1];
             let message = parts[2];
 
@@ -182,11 +182,16 @@ async fn main() -> Result<()> {
             }
 
             let dm_payload = format!("{}@{}: {}", args.name, my_id_prefix, message);
-            
+
             match node.send(peer_identity, dm_payload.into_bytes()).await {
                 Ok(response) => {
                     let response_text = String::from_utf8_lossy(&response);
-                    println!("\x1b[33m[dm → {}...]\x1b[0m {} (ack: {})", &peer_identity[..8], message, response_text);
+                    println!(
+                        "\x1b[33m[dm → {}...]\x1b[0m {} (ack: {})",
+                        &peer_identity[..8],
+                        message,
+                        response_text
+                    );
                 }
                 Err(e) => {
                     eprintln!("\x1b[31m[dm error]\x1b[0m Failed to send: {}", e);
@@ -197,7 +202,10 @@ async fn main() -> Result<()> {
 
         let formatted = format!("{}@{}: {}", args.name, my_id_prefix, line);
 
-        if let Err(e) = node.publish(&room_topic, formatted.as_bytes().to_vec()).await {
+        if let Err(e) = node
+            .publish(&room_topic, formatted.as_bytes().to_vec())
+            .await
+        {
             eprintln!("Failed to send message: {}", e);
         } else {
             println!("\x1b[32m[room]\x1b[0m {}", formatted);

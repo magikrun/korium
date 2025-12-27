@@ -38,46 +38,66 @@ async fn three_node_pubsub_broadcast() {
     let node_a = Node::bind(&test_addr()).await.expect("node_a bind failed");
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
     let node_c = Node::bind(&test_addr()).await.expect("node_c bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
-    
+
     // Build network: B → A, C → A
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("node_b bootstrap failed");
-    node_c.bootstrap(&node_a_id, &node_a_addr).await.expect("node_c bootstrap failed");
-    
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_b bootstrap failed");
+    node_c
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_c bootstrap failed");
+
     let topic = "broadcast-test";
-    
+
     // All nodes subscribe
-    node_a.subscribe(topic).await.expect("node_a subscribe failed");
-    node_b.subscribe(topic).await.expect("node_b subscribe failed");
-    node_c.subscribe(topic).await.expect("node_c subscribe failed");
-    
+    node_a
+        .subscribe(topic)
+        .await
+        .expect("node_a subscribe failed");
+    node_b
+        .subscribe(topic)
+        .await
+        .expect("node_b subscribe failed");
+    node_c
+        .subscribe(topic)
+        .await
+        .expect("node_c subscribe failed");
+
     // Allow mesh formation
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     // Get message receivers BEFORE publishing
     let mut rx_b = node_b.messages().await.expect("node_b messages failed");
     let mut rx_c = node_c.messages().await.expect("node_c messages failed");
-    
+
     // Node A publishes a message
     let test_data = b"hello from node A".to_vec();
-    node_a.publish(topic, test_data.clone()).await.expect("publish failed");
-    
+    node_a
+        .publish(topic, test_data.clone())
+        .await
+        .expect("publish failed");
+
     // Node B should receive the message
-    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv()).await
+    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv())
+        .await
         .expect("node_b receive timeout")
         .expect("node_b channel closed");
-    
+
     assert_eq!(msg_b.topic, topic);
     assert_eq!(msg_b.from, node_a_id);
     assert_eq!(msg_b.data, test_data);
-    
+
     // Node C should also receive the message
-    let msg_c = timeout(TEST_TIMEOUT, rx_c.recv()).await
+    let msg_c = timeout(TEST_TIMEOUT, rx_c.recv())
+        .await
         .expect("node_c receive timeout")
         .expect("node_c channel closed");
-    
+
     assert_eq!(msg_c.topic, topic);
     assert_eq!(msg_c.from, node_a_id);
     assert_eq!(msg_c.data, test_data);
@@ -95,54 +115,90 @@ async fn five_node_selective_subscription() {
     let node_c = Node::bind(&test_addr()).await.expect("node_c bind failed");
     let node_d = Node::bind(&test_addr()).await.expect("node_d bind failed");
     let node_e = Node::bind(&test_addr()).await.expect("node_e bind failed"); // Not subscribed
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
-    
+
     // Build network: all nodes bootstrap from A
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("node_b bootstrap failed");
-    node_c.bootstrap(&node_a_id, &node_a_addr).await.expect("node_c bootstrap failed");
-    node_d.bootstrap(&node_a_id, &node_a_addr).await.expect("node_d bootstrap failed");
-    node_e.bootstrap(&node_a_id, &node_a_addr).await.expect("node_e bootstrap failed");
-    
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_b bootstrap failed");
+    node_c
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_c bootstrap failed");
+    node_d
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_d bootstrap failed");
+    node_e
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_e bootstrap failed");
+
     let topic = "selective-test";
-    
+
     // Only A, B, C, D subscribe (E does NOT subscribe)
-    node_a.subscribe(topic).await.expect("node_a subscribe failed");
-    node_b.subscribe(topic).await.expect("node_b subscribe failed");
-    node_c.subscribe(topic).await.expect("node_c subscribe failed");
-    node_d.subscribe(topic).await.expect("node_d subscribe failed");
+    node_a
+        .subscribe(topic)
+        .await
+        .expect("node_a subscribe failed");
+    node_b
+        .subscribe(topic)
+        .await
+        .expect("node_b subscribe failed");
+    node_c
+        .subscribe(topic)
+        .await
+        .expect("node_c subscribe failed");
+    node_d
+        .subscribe(topic)
+        .await
+        .expect("node_d subscribe failed");
     // node_e intentionally does NOT subscribe
-    
+
     // Allow mesh formation
     tokio::time::sleep(Duration::from_millis(300)).await;
-    
+
     // Get message receivers
     let mut rx_b = node_b.messages().await.expect("node_b messages failed");
     let mut rx_c = node_c.messages().await.expect("node_c messages failed");
     let mut rx_d = node_d.messages().await.expect("node_d messages failed");
     let mut rx_e = node_e.messages().await.expect("node_e messages failed");
-    
+
     // Node A publishes
     let test_data = b"selective broadcast".to_vec();
-    node_a.publish(topic, test_data.clone()).await.expect("publish failed");
-    
+    node_a
+        .publish(topic, test_data.clone())
+        .await
+        .expect("publish failed");
+
     // Subscribed nodes should receive
-    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv()).await
-        .expect("node_b timeout").expect("node_b closed");
+    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv())
+        .await
+        .expect("node_b timeout")
+        .expect("node_b closed");
     assert_eq!(msg_b.data, test_data);
-    
-    let msg_c = timeout(TEST_TIMEOUT, rx_c.recv()).await
-        .expect("node_c timeout").expect("node_c closed");
+
+    let msg_c = timeout(TEST_TIMEOUT, rx_c.recv())
+        .await
+        .expect("node_c timeout")
+        .expect("node_c closed");
     assert_eq!(msg_c.data, test_data);
-    
-    let msg_d = timeout(TEST_TIMEOUT, rx_d.recv()).await
-        .expect("node_d timeout").expect("node_d closed");
+
+    let msg_d = timeout(TEST_TIMEOUT, rx_d.recv())
+        .await
+        .expect("node_d timeout")
+        .expect("node_d closed");
     assert_eq!(msg_d.data, test_data);
-    
+
     // Node E should NOT receive (not subscribed)
     let result_e = timeout(MESSAGE_WAIT, rx_e.recv()).await;
-    assert!(result_e.is_err(), "node_e should NOT receive message (not subscribed)");
+    assert!(
+        result_e.is_err(),
+        "node_e should NOT receive message (not subscribed)"
+    );
 }
 
 // =============================================================================
@@ -155,50 +211,76 @@ async fn message_deduplication() {
     let node_a = Node::bind(&test_addr()).await.expect("node_a bind failed");
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
     let node_c = Node::bind(&test_addr()).await.expect("node_c bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
     let node_b_id = node_b.identity();
     let node_b_addr = node_b.local_addr().unwrap().to_string();
-    
+
     // Build a triangle: B → A, C → A, C → B
     // This creates potential for duplicate message paths
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("B→A bootstrap failed");
-    node_c.bootstrap(&node_a_id, &node_a_addr).await.expect("C→A bootstrap failed");
-    node_c.bootstrap(&node_b_id, &node_b_addr).await.expect("C→B bootstrap failed");
-    
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("B→A bootstrap failed");
+    node_c
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("C→A bootstrap failed");
+    node_c
+        .bootstrap(&node_b_id, &node_b_addr)
+        .await
+        .expect("C→B bootstrap failed");
+
     let topic = "dedup-test";
-    
-    node_a.subscribe(topic).await.expect("node_a subscribe failed");
-    node_b.subscribe(topic).await.expect("node_b subscribe failed");
-    node_c.subscribe(topic).await.expect("node_c subscribe failed");
-    
+
+    node_a
+        .subscribe(topic)
+        .await
+        .expect("node_a subscribe failed");
+    node_b
+        .subscribe(topic)
+        .await
+        .expect("node_b subscribe failed");
+    node_c
+        .subscribe(topic)
+        .await
+        .expect("node_c subscribe failed");
+
     // Allow mesh formation
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     let mut rx_c = node_c.messages().await.expect("node_c messages failed");
-    
+
     // Node A publishes multiple times with SAME content
     // (note: same content from same source should have same MessageId)
     let test_data = b"dedup test message".to_vec();
-    node_a.publish(topic, test_data.clone()).await.expect("publish 1 failed");
-    
+    node_a
+        .publish(topic, test_data.clone())
+        .await
+        .expect("publish 1 failed");
+
     // First message should arrive
-    let msg1 = timeout(TEST_TIMEOUT, rx_c.recv()).await
+    let msg1 = timeout(TEST_TIMEOUT, rx_c.recv())
+        .await
         .expect("first message timeout")
         .expect("channel closed");
     assert_eq!(msg1.data, test_data);
-    
+
     // Wait and send again (different seqno, so it's a new message)
     tokio::time::sleep(Duration::from_millis(50)).await;
-    node_a.publish(topic, test_data.clone()).await.expect("publish 2 failed");
-    
+    node_a
+        .publish(topic, test_data.clone())
+        .await
+        .expect("publish 2 failed");
+
     // Second message with different seqno should also arrive
-    let msg2 = timeout(TEST_TIMEOUT, rx_c.recv()).await
+    let msg2 = timeout(TEST_TIMEOUT, rx_c.recv())
+        .await
         .expect("second message timeout")
         .expect("channel closed");
     assert_eq!(msg2.data, test_data);
-    
+
     // But the message should not be duplicated (no extra copies)
     // We verify by checking that no more messages arrive quickly
     let extra = timeout(MESSAGE_WAIT, rx_c.recv()).await;
@@ -214,50 +296,78 @@ async fn message_deduplication() {
 async fn multi_topic_subscriptions() {
     let node_a = Node::bind(&test_addr()).await.expect("node_a bind failed");
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
-    
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("bootstrap failed");
-    
+
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("bootstrap failed");
+
     let topic1 = "sports";
     let topic2 = "weather";
     let topic3 = "news";
-    
+
     // Node A subscribes to all topics
-    node_a.subscribe(topic1).await.expect("subscribe topic1 failed");
-    node_a.subscribe(topic2).await.expect("subscribe topic2 failed");
-    node_a.subscribe(topic3).await.expect("subscribe topic3 failed");
-    
+    node_a
+        .subscribe(topic1)
+        .await
+        .expect("subscribe topic1 failed");
+    node_a
+        .subscribe(topic2)
+        .await
+        .expect("subscribe topic2 failed");
+    node_a
+        .subscribe(topic3)
+        .await
+        .expect("subscribe topic3 failed");
+
     // Node B subscribes only to topic1 and topic2 (NOT topic3)
-    node_b.subscribe(topic1).await.expect("subscribe topic1 failed");
-    node_b.subscribe(topic2).await.expect("subscribe topic2 failed");
-    
+    node_b
+        .subscribe(topic1)
+        .await
+        .expect("subscribe topic1 failed");
+    node_b
+        .subscribe(topic2)
+        .await
+        .expect("subscribe topic2 failed");
+
     // Allow mesh formation
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     let mut rx_b = node_b.messages().await.expect("node_b messages failed");
-    
+
     // Publish to all three topics from node A
-    node_a.publish(topic1, b"sports update".to_vec()).await.expect("publish topic1 failed");
-    node_a.publish(topic2, b"weather report".to_vec()).await.expect("publish topic2 failed");
-    node_a.publish(topic3, b"breaking news".to_vec()).await.expect("publish topic3 failed");
-    
+    node_a
+        .publish(topic1, b"sports update".to_vec())
+        .await
+        .expect("publish topic1 failed");
+    node_a
+        .publish(topic2, b"weather report".to_vec())
+        .await
+        .expect("publish topic2 failed");
+    node_a
+        .publish(topic3, b"breaking news".to_vec())
+        .await
+        .expect("publish topic3 failed");
+
     // Collect messages received by node B
     let mut received_topics: HashSet<String> = HashSet::new();
-    
+
     // Should receive 2 messages (topic1 and topic2)
     for _ in 0..2 {
-        let msg = timeout(TEST_TIMEOUT, rx_b.recv()).await
+        let msg = timeout(TEST_TIMEOUT, rx_b.recv())
+            .await
             .expect("message timeout")
             .expect("channel closed");
         received_topics.insert(msg.topic.clone());
     }
-    
+
     // Verify received correct topics
     assert!(received_topics.contains(topic1), "should receive sports");
     assert!(received_topics.contains(topic2), "should receive weather");
-    
+
     // Should NOT receive topic3 (not subscribed)
     let extra = timeout(MESSAGE_WAIT, rx_b.recv()).await;
     assert!(extra.is_err(), "should not receive topic3 (not subscribed)");
@@ -272,45 +382,64 @@ async fn multi_topic_subscriptions() {
 async fn mesh_formation_graft_prune() {
     let node_a = Node::bind(&test_addr()).await.expect("node_a bind failed");
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
-    
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("bootstrap failed");
-    
+
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("bootstrap failed");
+
     let topic = "mesh-test";
-    
+
     // Initially only A subscribes
-    node_a.subscribe(topic).await.expect("node_a subscribe failed");
-    
+    node_a
+        .subscribe(topic)
+        .await
+        .expect("node_a subscribe failed");
+
     let mut rx_b = node_b.messages().await.expect("node_b messages failed");
-    
+
     // Publish from A - B should NOT receive (not subscribed)
-    node_a.publish(topic, b"before subscription".to_vec()).await.expect("publish failed");
+    node_a
+        .publish(topic, b"before subscription".to_vec())
+        .await
+        .expect("publish failed");
     let result = timeout(MESSAGE_WAIT, rx_b.recv()).await;
     assert!(result.is_err(), "B should not receive before subscribing");
-    
+
     // Now B subscribes (triggers GRAFT to A)
-    node_b.subscribe(topic).await.expect("node_b subscribe failed");
-    
+    node_b
+        .subscribe(topic)
+        .await
+        .expect("node_b subscribe failed");
+
     // Allow mesh formation (graft exchange)
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     // Now B should receive messages
-    node_a.publish(topic, b"after subscription".to_vec()).await.expect("publish failed");
-    let msg = timeout(TEST_TIMEOUT, rx_b.recv()).await
+    node_a
+        .publish(topic, b"after subscription".to_vec())
+        .await
+        .expect("publish failed");
+    let msg = timeout(TEST_TIMEOUT, rx_b.recv())
+        .await
         .expect("message timeout after subscribe")
         .expect("channel closed");
     assert_eq!(msg.data, b"after subscription".to_vec());
-    
+
     // B unsubscribes (triggers PRUNE to A)
     node_b.unsubscribe(topic).await.expect("unsubscribe failed");
-    
+
     // Allow mesh update
     tokio::time::sleep(Duration::from_millis(100)).await;
-    
+
     // B should no longer receive
-    node_a.publish(topic, b"after unsubscribe".to_vec()).await.expect("publish failed");
+    node_a
+        .publish(topic, b"after unsubscribe".to_vec())
+        .await
+        .expect("publish failed");
     let result = timeout(MESSAGE_WAIT, rx_b.recv()).await;
     assert!(result.is_err(), "B should not receive after unsubscribing");
 }
@@ -324,30 +453,43 @@ async fn mesh_formation_graft_prune() {
 async fn message_signature_verification() {
     let node_a = Node::bind(&test_addr()).await.expect("node_a bind failed");
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
-    
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("bootstrap failed");
-    
+
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("bootstrap failed");
+
     let topic = "signed-test";
-    
-    node_a.subscribe(topic).await.expect("node_a subscribe failed");
-    node_b.subscribe(topic).await.expect("node_b subscribe failed");
-    
+
+    node_a
+        .subscribe(topic)
+        .await
+        .expect("node_a subscribe failed");
+    node_b
+        .subscribe(topic)
+        .await
+        .expect("node_b subscribe failed");
+
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     let mut rx_b = node_b.messages().await.expect("node_b messages failed");
-    
+
     // Publish a message - it will be signed internally by GossipSub
     let test_data = b"signed message content".to_vec();
-    node_a.publish(topic, test_data.clone()).await.expect("publish failed");
-    
+    node_a
+        .publish(topic, test_data.clone())
+        .await
+        .expect("publish failed");
+
     // Receive the message
-    let msg = timeout(TEST_TIMEOUT, rx_b.recv()).await
+    let msg = timeout(TEST_TIMEOUT, rx_b.recv())
+        .await
         .expect("receive timeout")
         .expect("channel closed");
-    
+
     // Verify the source matches the publishing node's identity
     // (if signature verification failed, the message would have been rejected)
     assert_eq!(msg.from, node_a_id, "message source should be node_a");
@@ -365,46 +507,66 @@ async fn message_signature_verification() {
 async fn publisher_does_not_receive_own_messages() {
     let node_a = Node::bind(&test_addr()).await.expect("node_a bind failed");
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_b_id = node_b.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
-    
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("bootstrap failed");
-    
+
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("bootstrap failed");
+
     let topic = "no-loopback-test";
-    
-    node_a.subscribe(topic).await.expect("node_a subscribe failed");
-    node_b.subscribe(topic).await.expect("node_b subscribe failed");
-    
+
+    node_a
+        .subscribe(topic)
+        .await
+        .expect("node_a subscribe failed");
+    node_b
+        .subscribe(topic)
+        .await
+        .expect("node_b subscribe failed");
+
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     let mut rx_a = node_a.messages().await.expect("node_a messages failed");
     let mut rx_b = node_b.messages().await.expect("node_b messages failed");
-    
+
     // Node A publishes
-    node_a.publish(topic, b"from A".to_vec()).await.expect("A publish failed");
-    
+    node_a
+        .publish(topic, b"from A".to_vec())
+        .await
+        .expect("A publish failed");
+
     // Node B should receive the message
-    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv()).await
+    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv())
+        .await
         .expect("B receive timeout")
         .expect("B channel closed");
     assert_eq!(msg_b.from, node_a_id);
     assert_eq!(msg_b.data, b"from A".to_vec());
-    
+
     // Node B publishes - Node A should receive
-    node_b.publish(topic, b"from B".to_vec()).await.expect("B publish failed");
-    
-    let msg_a = timeout(TEST_TIMEOUT, rx_a.recv()).await
+    node_b
+        .publish(topic, b"from B".to_vec())
+        .await
+        .expect("B publish failed");
+
+    let msg_a = timeout(TEST_TIMEOUT, rx_a.recv())
+        .await
         .expect("A receive from B timeout")
         .expect("A channel closed");
     assert_eq!(msg_a.from, node_b_id);
     assert_eq!(msg_a.data, b"from B".to_vec());
-    
+
     // Verify A did NOT receive its own message (should be empty or only have B's message)
     // Since we already consumed msg_a (from B), rx_a should be empty now
     let extra = timeout(Duration::from_millis(100), rx_a.recv()).await;
-    assert!(extra.is_err(), "Node A should NOT have received its own message");
+    assert!(
+        extra.is_err(),
+        "Node A should NOT have received its own message"
+    );
 }
 
 // =============================================================================
@@ -419,40 +581,53 @@ async fn chain_topology_propagation() {
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
     let node_c = Node::bind(&test_addr()).await.expect("node_c bind failed");
     let node_d = Node::bind(&test_addr()).await.expect("node_d bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
     let node_b_id = node_b.identity();
     let node_b_addr = node_b.local_addr().unwrap().to_string();
     let node_c_id = node_c.identity();
     let node_c_addr = node_c.local_addr().unwrap().to_string();
-    
+
     // Build chain
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("B→A failed");
-    node_c.bootstrap(&node_b_id, &node_b_addr).await.expect("C→B failed");
-    node_d.bootstrap(&node_c_id, &node_c_addr).await.expect("D→C failed");
-    
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("B→A failed");
+    node_c
+        .bootstrap(&node_b_id, &node_b_addr)
+        .await
+        .expect("C→B failed");
+    node_d
+        .bootstrap(&node_c_id, &node_c_addr)
+        .await
+        .expect("D→C failed");
+
     let topic = "chain-test";
-    
+
     // All nodes subscribe
     node_a.subscribe(topic).await.expect("A subscribe failed");
     node_b.subscribe(topic).await.expect("B subscribe failed");
     node_c.subscribe(topic).await.expect("C subscribe failed");
     node_d.subscribe(topic).await.expect("D subscribe failed");
-    
+
     // Allow mesh formation across the chain
     tokio::time::sleep(Duration::from_millis(400)).await;
-    
+
     let mut rx_d = node_d.messages().await.expect("D messages failed");
-    
+
     // A publishes - should propagate A → B → C → D
-    node_a.publish(topic, b"from the start".to_vec()).await.expect("publish failed");
-    
+    node_a
+        .publish(topic, b"from the start".to_vec())
+        .await
+        .expect("publish failed");
+
     // D (at the end of chain) should receive
-    let msg = timeout(TEST_TIMEOUT, rx_d.recv()).await
+    let msg = timeout(TEST_TIMEOUT, rx_d.recv())
+        .await
         .expect("D receive timeout")
         .expect("D channel closed");
-    
+
     assert_eq!(msg.from, node_a_id);
     assert_eq!(msg.data, b"from the start".to_vec());
 }
@@ -466,19 +641,24 @@ async fn chain_topology_propagation() {
 #[tokio::test]
 async fn single_node_no_loopback() {
     let node = Node::bind(&test_addr()).await.expect("node bind failed");
-    
+
     let topic = "loopback-test";
     node.subscribe(topic).await.expect("subscribe failed");
-    
+
     let mut rx = node.messages().await.expect("messages failed");
-    
+
     // Publish a message
-    node.publish(topic, b"hello myself".to_vec()).await.expect("publish failed");
-    
+    node.publish(topic, b"hello myself".to_vec())
+        .await
+        .expect("publish failed");
+
     // Wait briefly and verify NO message is received (loopback should be suppressed)
     let result = timeout(Duration::from_millis(200), rx.recv()).await;
-    
-    assert!(result.is_err(), "single node should NOT receive its own published message");
+
+    assert!(
+        result.is_err(),
+        "single node should NOT receive its own published message"
+    );
 }
 
 // =============================================================================
@@ -486,15 +666,15 @@ async fn single_node_no_loopback() {
 // =============================================================================
 
 /// Test that P6 IP colocation scoring applies penalties to peers from the same subnet.
-/// 
+///
 /// All localhost nodes share the same 127.0.0.0/16 prefix, so they should all
 /// receive P6 colocation penalties when there are multiple peers. This test
 /// verifies that the scoring mechanism is active and penalizing colocated peers.
-/// 
+///
 /// With N peers from the same /16:
 /// - P6 factor = (N - 1)² for N > 1
 /// - P6 penalty = -10.0 × (N - 1)²
-/// 
+///
 /// For 5 localhost nodes: factor = 4² = 16, penalty = -160 per peer
 #[tokio::test]
 async fn p6_colocation_penalty_applies_to_same_prefix_peers() {
@@ -504,57 +684,95 @@ async fn p6_colocation_penalty_applies_to_same_prefix_peers() {
     let node_c = Node::bind(&test_addr()).await.expect("node_c bind failed");
     let node_d = Node::bind(&test_addr()).await.expect("node_d bind failed");
     let node_e = Node::bind(&test_addr()).await.expect("node_e bind failed");
-    
+
     let node_a_id = node_a.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
-    
+
     // All nodes bootstrap to A (creates mesh connections)
-    node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("node_b bootstrap failed");
-    node_c.bootstrap(&node_a_id, &node_a_addr).await.expect("node_c bootstrap failed");
-    node_d.bootstrap(&node_a_id, &node_a_addr).await.expect("node_d bootstrap failed");
-    node_e.bootstrap(&node_a_id, &node_a_addr).await.expect("node_e bootstrap failed");
-    
+    node_b
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_b bootstrap failed");
+    node_c
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_c bootstrap failed");
+    node_d
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_d bootstrap failed");
+    node_e
+        .bootstrap(&node_a_id, &node_a_addr)
+        .await
+        .expect("node_e bootstrap failed");
+
     let topic = "p6-colocation-test";
-    
+
     // All nodes subscribe to form mesh
-    node_a.subscribe(topic).await.expect("node_a subscribe failed");
-    node_b.subscribe(topic).await.expect("node_b subscribe failed");
-    node_c.subscribe(topic).await.expect("node_c subscribe failed");
-    node_d.subscribe(topic).await.expect("node_d subscribe failed");
-    node_e.subscribe(topic).await.expect("node_e subscribe failed");
-    
+    node_a
+        .subscribe(topic)
+        .await
+        .expect("node_a subscribe failed");
+    node_b
+        .subscribe(topic)
+        .await
+        .expect("node_b subscribe failed");
+    node_c
+        .subscribe(topic)
+        .await
+        .expect("node_c subscribe failed");
+    node_d
+        .subscribe(topic)
+        .await
+        .expect("node_d subscribe failed");
+    node_e
+        .subscribe(topic)
+        .await
+        .expect("node_e subscribe failed");
+
     // Allow mesh formation and P6 scoring to activate
     tokio::time::sleep(Duration::from_millis(500)).await;
-    
+
     // Get message receivers
     let mut rx_b = node_b.messages().await.expect("node_b messages failed");
     let mut rx_c = node_c.messages().await.expect("node_c messages failed");
     let mut rx_d = node_d.messages().await.expect("node_d messages failed");
     let mut rx_e = node_e.messages().await.expect("node_e messages failed");
-    
+
     // Node A publishes - message should still propagate despite P6 penalties
     // (P6 reduces scores but doesn't block messages entirely in normal operation)
     let test_data = b"p6 colocation test".to_vec();
-    node_a.publish(topic, test_data.clone()).await.expect("publish failed");
-    
+    node_a
+        .publish(topic, test_data.clone())
+        .await
+        .expect("publish failed");
+
     // All subscribed nodes should still receive the message
     // P6 penalty affects mesh peer selection priority, not message delivery
-    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv()).await
-        .expect("node_b timeout").expect("node_b closed");
+    let msg_b = timeout(TEST_TIMEOUT, rx_b.recv())
+        .await
+        .expect("node_b timeout")
+        .expect("node_b closed");
     assert_eq!(msg_b.data, test_data, "node_b should receive message");
-    
-    let msg_c = timeout(TEST_TIMEOUT, rx_c.recv()).await
-        .expect("node_c timeout").expect("node_c closed");
+
+    let msg_c = timeout(TEST_TIMEOUT, rx_c.recv())
+        .await
+        .expect("node_c timeout")
+        .expect("node_c closed");
     assert_eq!(msg_c.data, test_data, "node_c should receive message");
-    
-    let msg_d = timeout(TEST_TIMEOUT, rx_d.recv()).await
-        .expect("node_d timeout").expect("node_d closed");
+
+    let msg_d = timeout(TEST_TIMEOUT, rx_d.recv())
+        .await
+        .expect("node_d timeout")
+        .expect("node_d closed");
     assert_eq!(msg_d.data, test_data, "node_d should receive message");
-    
-    let msg_e = timeout(TEST_TIMEOUT, rx_e.recv()).await
-        .expect("node_e timeout").expect("node_e closed");
+
+    let msg_e = timeout(TEST_TIMEOUT, rx_e.recv())
+        .await
+        .expect("node_e timeout")
+        .expect("node_e closed");
     assert_eq!(msg_e.data, test_data, "node_e should receive message");
-    
+
     // The P6 scoring is active internally - with 5 peers from same /16:
     // - Each peer has P6 factor = (5 - 1)² = 16
     // - With DEFAULT_P6_WEIGHT = -10.0, penalty = -160 per peer
